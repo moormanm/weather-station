@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 Weather Station - Stability Edition
-Added 429 Rate-Limit Backoff & GPU Memory Optimizations
 """
 
 import pygame
@@ -15,6 +14,7 @@ import hashlib
 import urllib.request
 import urllib.error
 import random
+import re
 import io
 from datetime import datetime
 
@@ -24,32 +24,36 @@ LOCATION_NAME = "Frederick, MD"
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
 
-# Sub-tile pixel offset of exact location within its zoom-10 tile.
-# Used to position the location dot accurately on the map.
-def _loc_pixel_offset(lat, lon, zoom=10):
-    import math
+MAP_ZOOM = 7  # zoom level for both basemap and radar tiles (RainViewer max = 7)
+
+def _loc_pixel_offset(lat, lon, zoom):
+    """Sub-tile pixel offset of exact location from center of its tile at given zoom."""
     n = 2 ** zoom
     lat_rad = math.radians(lat)
     xt = int((lon + 180.0) / 360.0 * n)
     yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
-    fx = (lon + 180.0) / 360.0 * n - xt  # fractional position within tile [0,1)
+    fx = (lon + 180.0) / 360.0 * n - xt
     fy = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n - yt
-    # Pixel offset from center of the 256px tile
     return int(fx * 256 - 128), int(fy * 256 - 128)
 
-LOC_DOT_OFFSET = _loc_pixel_offset(LATITUDE, LONGITUDE)  # (dx_px, dy_px) from box center
+LOC_DOT_OFFSET = _loc_pixel_offset(LATITUDE, LONGITUDE, MAP_ZOOM)
 
-USER_AGENT = "FrederickWeatherStation/1.7 (RPi3B+; Dashboard)"
+USER_AGENT = "FrederickWeatherStation/1.8 (RPi3B+; Dashboard)"
 HEADERS = {"User-Agent": USER_AGENT}
 
+NWS_FORECAST_URL = "https://api.weather.gov/gridpoints/LWX/80,95/forecast"
+NWS_STATIONS_URL = "https://api.weather.gov/stations/KFDK/observations?limit=24"
+TILE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "weather_station_tiles")
+os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+
 # ── Colors ────────────────────────────────────────────────────────────────────
-BG, PANEL, PANEL2 = (10, 14, 26), (18, 24, 42), (22, 30, 52)
+BG, PANEL = (10, 14, 26), (18, 24, 42)
 ACCENT, GOLD, RAIN = (64, 196, 255), (255, 200, 80), (60, 140, 255)
 TEXT_DIM, TEXT_BRIGHT = (110, 130, 170), (255, 255, 255)
-# Icons: only use codepoints confirmed present in DejaVu Sans on Raspberry Pi OS
-# U+2600 ☀  U+2601 ☁  U+2602 ☂  U+2603 ☃  — core Misc Symbols, always present
-# U+26C6 ⛆  — confirmed working in session
-# Avoid ⛅ ☔ ❄ ⚡ — unreliable across DejaVu versions; use ☁ / ☂ / ☃ / ☂ instead
+GREEN, RED = (60, 220, 100), (220, 70, 70)
+
+# Icons: only codepoints confirmed in DejaVu Sans on Raspberry Pi OS
+# U+2600 ☀  U+2601 ☁  U+2602 ☂  U+2603 ☃  — always present
 WMO_ICON = {
     0:"☀",  1:"☀",  2:"☁",  3:"☁",
     45:"☂", 48:"☂",
@@ -61,18 +65,15 @@ WMO_ICON = {
     95:"☂", 96:"☂", 99:"☂",
 }
 WMO_DESC = {
-    0:"Clear sky",     1:"Mainly clear",   2:"Partly cloudy",  3:"Overcast",
-    45:"Fog",          48:"Icy fog",
-    51:"Lt drizzle",   53:"Drizzle",        55:"Hvy drizzle",
-    61:"Lt rain",      63:"Rain",           65:"Hvy rain",
-    71:"Lt snow",      73:"Snow",           75:"Hvy snow",      77:"Snow grains",
-    80:"Showers",      81:"Showers",        82:"Hvy showers",
-    85:"Snow showers", 86:"Hvy snow shwr",
-    95:"Thunderstorm", 96:"T-storm/hail",   99:"Hvy t-storm",
+    0:"Clear sky",       1:"Mainly clear",    2:"Partly cloudy",   3:"Overcast",
+    45:"Fog",            48:"Icy fog",
+    51:"Light drizzle",  53:"Drizzle",         55:"Heavy drizzle",
+    61:"Light rain",     63:"Rain",            65:"Heavy rain",
+    71:"Light snow",     73:"Snow",            75:"Heavy snow",     77:"Snow grains",
+    80:"Showers",        81:"Showers",         82:"Heavy showers",
+    85:"Snow showers",   86:"Heavy snow showers",
+    95:"Thunderstorm",   96:"T-storm w/ hail", 99:"Heavy t-storm",
 }
-
-TILE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "weather_station_tiles")
-os.makedirs(TILE_CACHE_DIR, exist_ok=True)
 
 # ── Data Core ─────────────────────────────────────────────────────────────────
 WIND_DIR = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
@@ -81,27 +82,22 @@ def _wind_direction(deg):
     return WIND_DIR[round(deg / 22.5) % 16]
 
 def _build_motd_pool(data):
-    """Return a list of data-driven messages from the latest weather payload."""
     cur = data.get("current_weather", {})
     daily = data.get("daily", {})
     messages = []
-
     temp = cur.get("temperature")
     if temp is not None:
         messages.append(f"Currently {round(temp)}\u00b0F.")
-
     wind_speed = cur.get("windspeed")
     wind_dir = cur.get("winddirection")
     if wind_speed is not None and wind_dir is not None:
         messages.append(f"Winds {_wind_direction(wind_dir)} at {round(wind_speed)} mph.")
-
     try:
         hi = round(daily["temperature_2m_max"][0])
         lo = round(daily["temperature_2m_min"][0])
         messages.append(f"Today: high {hi}\u00b0F, low {lo}\u00b0F.")
     except (KeyError, IndexError, TypeError):
         pass
-
     try:
         precip_mm = daily["precipitation_sum"][0]
         precip_in = precip_mm / 25.4
@@ -111,7 +107,6 @@ def _build_motd_pool(data):
             messages.append("No precipitation expected today.")
     except (KeyError, IndexError, TypeError):
         pass
-
     try:
         code = cur.get("weathercode")
         desc = WMO_DESC.get(code)
@@ -119,7 +114,6 @@ def _build_motd_pool(data):
             messages.append(f"Conditions: {desc}.")
     except Exception:
         pass
-
     return messages if messages else ["Loading weather..."]
 
 
@@ -137,24 +131,123 @@ def safe_fetch(url, timeout=15):
         print(f"Fetch error: {e}")
         return None
 
+
+def _fetch_nws_hilo():
+    """Return dict of {date_str: (hi_f, lo_f)} from NWS forecast + today's observed high."""
+    hilo = {}
+    try:
+        # NWS 7-day forecast for days 1+
+        raw = safe_fetch(NWS_FORECAST_URL)
+        if raw and raw != "RATE_LIMITED":
+            periods = json.loads(raw.decode())["properties"]["periods"]
+            hi_by_date = {}
+            lo_by_date = {}
+            for p in periods:
+                date = p["startTime"][:10]
+                temp = p["temperature"]  # already in °F (NWS default)
+                if p["isDaytime"]:
+                    hi_by_date[date] = temp
+                else:
+                    lo_by_date[date] = temp
+            all_dates = set(list(hi_by_date.keys()) + list(lo_by_date.keys()))
+            for date in all_dates:
+                hi = hi_by_date.get(date)
+                lo = lo_by_date.get(date)
+                if hi is not None or lo is not None:
+                    hilo[date] = (hi, lo)
+    except Exception as e:
+        print(f"NWS forecast fetch error: {e}")
+
+    try:
+        # Today's observed high from KFDK (Frederick Municipal Airport)
+        raw = safe_fetch(NWS_STATIONS_URL)
+        if raw and raw != "RATE_LIMITED":
+            obs = json.loads(raw.decode())["features"]
+            today = datetime.now().strftime("%Y-%m-%d")
+            today_temps = []
+            for o in obs:
+                ts = o["properties"]["timestamp"]
+                t_c = o["properties"]["temperature"]["value"]
+                if ts[:10] == today and t_c is not None:
+                    today_temps.append(t_c * 9/5 + 32)
+            if today_temps:
+                obs_hi = round(max(today_temps))
+                existing = hilo.get(today, (None, None))
+                # Use the greater of observed high and forecast high; keep forecast low
+                forecast_hi = existing[0]
+                hi = max(obs_hi, forecast_hi) if forecast_hi is not None else obs_hi
+                hilo[today] = (hi, existing[1])
+    except Exception as e:
+        print(f"NWS observation fetch error: {e}")
+
+    return hilo
+
+
+def _load_ram_history():
+    try:
+        with open(RAM_HISTORY_FILE, "r") as f:
+            return json.load(f).get("history", [])
+    except Exception:
+        return []
+
+def _save_ram_history(history):
+    try:
+        with open(RAM_HISTORY_FILE, "w") as f:
+            json.dump({"history": history}, f)
+    except Exception as e:
+        print(f"RAM history save error: {e}")
+
+def _fetch_ddr5_price():
+    """Scrape DRAM Exchange for DDR5 UDIMM 16GB 4800/5600 spot price and % change.
+    Returns (price_float, pct_change_float) or (None, None) on failure."""
+    raw = safe_fetch("https://www.dramexchange.com/", timeout=15)
+    if not raw or raw == "RATE_LIMITED":
+        return None, None
+    try:
+        html = raw.decode("utf-8", errors="replace")
+        # Find the DDR5 UDIMM 16GB row and grab the avg price and % change
+        m = re.search(
+            r'DDR5 UDIMM 16GB[^<]*</a>.*?'
+            r'<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>\s*'
+            r'<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>\s*'
+            r'<td[^>]*>([\d.]+)</td>.*?'
+            r'([-+]?[\d.]+)\s*%',
+            html, re.DOTALL
+        )
+        if m:
+            avg_price = float(m.group(5))
+            pct = float(m.group(6))
+            return avg_price, pct
+    except Exception as e:
+        print(f"DDR5 parse error: {e}")
+    return None, None
+
+
 class AppState:
     def __init__(self):
         self.weather = None
+        self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
         self.map_tiles = {}
         self.radar_tiles = {}
-        self.radar_crop_data = None
-        self.radar_crop_rect = None
         self.last_weather_upd = 0
         self.last_map_upd = 0
+        self.last_ram_upd = 0
         self.backoff_until = 0
         self.motd = "Fetching weather..."
         self.motd_pool = []
         self.motd_index = 0
         self.motd_last_cycle = 0
+        # RAM price state
+        self.ram_price = None           # current price
+        self.ram_pct = None             # % change from DRAM Exchange
+        self.ram_delta_24h = None       # dollar diff vs ~24h ago
+        self.ram_delta_7d = None        # dollar diff vs ~7d ago
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
+        self._ram_running = False
 
+    # ── Weather ───────────────────────────────────────────────────────────────
     def update_weather(self):
         if self._weather_running:
             return
@@ -167,32 +260,33 @@ class AppState:
     def _do_update_weather(self):
         if time.time() < self.backoff_until:
             return
-
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
                f"&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
-               f"&current_weather=true&temperature_unit=fahrenheit&timezone={TIMEZONE}&forecast_days=7")
-        
+               f"&current_weather=true&temperature_unit=fahrenheit&timezone={TIMEZONE}&forecast_days=7"
+               f"&models=gfs_global")
         raw = safe_fetch(url)
         if raw == "RATE_LIMITED":
-            self.backoff_until = time.time() + 1800 # Wait 30 mins
+            self.backoff_until = time.time() + 1800
             self.motd = "Weather service busy. Retrying later..."
             return
-
         if raw:
             try:
                 data = json.loads(raw.decode())
+                nws_hilo = _fetch_nws_hilo()
                 with self.lock:
                     self.weather = data
+                    self.nws_hilo = nws_hilo
                     self.last_weather_upd = time.time()
                     self.motd_pool = _build_motd_pool(data)
                     self.motd_index = 0
                     self.motd = self.motd_pool[0]
             except Exception as e:
                 print(f"Weather parse error: {e}")
-                self.last_weather_upd = 0  # Allow retry on next cycle
+                self.last_weather_upd = 0
         else:
-            self.last_weather_upd = 0  # Fetch failed — retry next cycle
+            self.last_weather_upd = 0
 
+    # ── Map + Radar ───────────────────────────────────────────────────────────
     def update_map(self):
         if self._map_running:
             return
@@ -203,82 +297,170 @@ class AppState:
             self._map_running = False
 
     def _do_update_map(self):
-        zoom = 10
+        zoom = MAP_ZOOM  # 7
         lat_rad = math.radians(LATITUDE)
-        n = 2**zoom
+        n = 2 ** zoom
         xt = int((LONGITUDE + 180.0) / 360.0 * n)
-        yt = int((1.0 - math.log(math.tan(lat_rad) + (1 / math.cos(lat_rad))) / math.pi) / 2.0 * n)
-        
-        # Base Tiles — light_all for readable colors
+        yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
+
+        # 3×3 basemap tiles at zoom 7
         new_tiles = {}
         for dy in range(-1, 2):
             for dx in range(-1, 2):
                 url = f"https://basemaps.cartocdn.com/light_all/{zoom}/{xt+dx}/{yt+dy}.png"
                 fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
                 if os.path.exists(fname):
-                    with open(fname, "rb") as f: data = f.read()
+                    with open(fname, "rb") as f:
+                        data = f.read()
                 else:
                     data = safe_fetch(url, timeout=5)
                     if data and data != "RATE_LIMITED" and len(data) > 2000:
-                        with open(fname, "wb") as f: f.write(data)
-                if data and data != "RATE_LIMITED": new_tiles[(dx, dy)] = data
-        
-        # Radar — RainViewer only supports zoom ≤ 7 for x/y tile endpoint.
-        # Fetch a 2×2 grid of zoom-7 tiles to guarantee full coverage of the
-        # 3×3 zoom-10 base tile area regardless of where the location falls
-        # within a tile.  The 2×2 grid is stitched (512×512) and then scaled
-        # 4× to 2048×2048 in draw_screen before cropping.
-        # Color scheme 6 = RAINBOW@SELEX — vibrant, easy to read.
+                        with open(fname, "wb") as f:
+                            f.write(data)
+                if data and data != "RATE_LIMITED":
+                    new_tiles[(dx, dy)] = data
+
+        # Radar — fetch same 3×3 grid of zoom-7 tiles as basemap so all nearby
+        # precipitation is visible, not just what falls on the single center tile.
         new_radar_tiles = {}
-        new_radar_crop_rect = None
         meta = safe_fetch("https://api.rainviewer.com/public/weather-maps.json")
         if meta and meta != "RATE_LIMITED":
             try:
                 rv = json.loads(meta.decode())
                 path, host = rv["radar"]["past"][-1]["path"], rv["host"]
-                rz = 7  # max supported zoom
-                scale = 2 ** (zoom - rz)  # = 8 (zoom-10 pixels per zoom-7 tile pixel)
-                # Top-left zoom-7 tile that contains our zoom-10 center tile
-                rx = xt >> (zoom - rz)
-                ry_tile = yt >> (zoom - rz)
-                # Fetch 2×2 grid: (rx,ry), (rx+1,ry), (rx,ry+1), (rx+1,ry+1)
-                all_ok = True
-                fetched = {}
-                for tdx in range(2):
-                    for tdy in range(2):
-                        ru = f"{host}{path}/256/{rz}/{rx+tdx}/{ry_tile+tdy}/6/1_1.png"
-                        raw = safe_fetch(ru, timeout=10)
-                        if raw and raw != "RATE_LIMITED" and len(raw) > 2000:
-                            fetched[(tdx, tdy)] = raw
-                        else:
-                            all_ok = False
-                            print(f"Radar tile ({tdx},{tdy}) missing or invalid (len={len(raw) if raw and raw != 'RATE_LIMITED' else 0})")
-                if fetched:
-                    # The stitched 512×512 surface covers 2×2 zoom-7 tiles = 16×16 zoom-10 tiles.
-                    # We scale it 8× to 4096×4096 so that 1 zoom-10 tile = 256px,
-                    # exactly matching the basemap tile resolution.
-                    # Pixel position of center zoom-10 tile (xt,yt) in the 4096px surface:
-                    px = (xt - rx * scale) * 256   # scale=8, so offset in zoom-10 tiles × 256px
-                    py = (yt - ry_tile * scale) * 256
-                    # Crop 768×768 = 3×3 zoom-10 tiles starting 1 tile before center
-                    crop_x = px - 256
-                    crop_y = py - 256
-                    new_radar_tiles = fetched
-                    new_radar_crop_rect = (max(0, crop_x), max(0, crop_y), 768, 768)
+                for dy in range(-1, 2):
+                    for dx in range(-1, 2):
+                        radar_url = f"{host}{path}/256/{zoom}/{xt+dx}/{yt+dy}/6/1_1.png"
+                        raw = safe_fetch(radar_url, timeout=10)
+                        if raw and raw != "RATE_LIMITED" and len(raw) > 300:
+                            new_radar_tiles[(dx, dy)] = raw
             except Exception as e:
                 print(f"Radar fetch error: {e}")
 
         with self.lock:
             self.map_tiles = new_tiles
             self.radar_tiles = new_radar_tiles
-            self.radar_crop_data = None  # unused (single-tile approach replaced)
-            self.radar_crop_rect = new_radar_crop_rect
             self.last_map_upd = time.time()
+
+    # ── RAM Price ─────────────────────────────────────────────────────────────
+    def update_ram(self):
+        if self._ram_running:
+            return
+        self._ram_running = True
+        try:
+            self._do_update_ram()
+        finally:
+            self._ram_running = False
+
+    def _do_update_ram(self):
+        price, pct = _fetch_ddr5_price()
+        if price is None:
+            print("RAM price fetch failed")
+            return
+        now = time.time()
+        history = _load_ram_history()
+        history.append({"ts": now, "price": price})
+        # Keep only last 10 days of entries
+        cutoff = now - 10 * 86400
+        history = [e for e in history if e["ts"] >= cutoff]
+        _save_ram_history(history)
+
+        # Find deltas: most recent entry older than 24h and 7d
+        delta_24h = None
+        delta_7d = None
+        for entry in reversed(history[:-1]):  # skip the entry we just appended
+            age = now - entry["ts"]
+            if delta_24h is None and age >= 20 * 3600:  # at least 20h old = "yesterday"
+                delta_24h = price - entry["price"]
+            if delta_7d is None and age >= 6 * 86400:   # at least 6d old = "last week"
+                delta_7d = price - entry["price"]
+            if delta_24h is not None and delta_7d is not None:
+                break
+
+        with self.lock:
+            self.ram_price = price
+            self.ram_pct = pct
+            self.ram_delta_24h = delta_24h
+            self.ram_delta_7d = delta_7d
+            self.last_ram_upd = now
+
 
 # ── UI Rendering ──────────────────────────────────────────────────────────────
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
     img = font.render(str(text), True, color)
     surf.blit(img, img.get_rect(**{anchor: (x, y)}))
+
+
+def draw_map(screen, state, fonts, mx, my, mw, mh):
+    """Draw the basemap tiles + radar overlay + location dot into a rounded-clipped area."""
+    if not state.map_tiles:
+        return
+
+    # Render tiles onto an intermediate surface the size of the tile grid (768×768)
+    tile_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
+    tile_ox = (mw - 768) // 2
+    tile_oy = (mh - 768) // 2
+
+    for (dx, dy), d in state.map_tiles.items():
+        try:
+            img = pygame.image.load(io.BytesIO(d)).convert_alpha()
+            tile_surf.blit(img, ((dx + 1) * 256, (dy + 1) * 256))
+        except Exception:
+            pass
+
+    # Radar overlay: blit each tile at the same position as its basemap counterpart
+    for (dx, dy), blob in state.radar_tiles.items():
+        try:
+            rd = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+            rd.set_alpha(180)
+            tile_surf.blit(rd, ((dx + 1) * 256, (dy + 1) * 256))
+        except Exception as e:
+            print(f"Radar draw error: {e}")
+
+    # Location dot on the tile surface
+    dot_x = 256 + 128 + LOC_DOT_OFFSET[0]  # center of center tile + sub-tile offset
+    dot_y = 256 + 128 + LOC_DOT_OFFSET[1]
+    pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 8, 2)
+
+    # Build a rounded-rect mask and apply it
+    mask_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
+    mask_surf.fill((0, 0, 0, 0))
+    pygame.draw.rect(mask_surf, (255, 255, 255, 255), (0, 0, 768, 768), border_radius=16)
+    # Multiply tile_surf alpha by mask
+    tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+
+    screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
+
+
+def draw_ram_widget(screen, state, fonts, x, y):
+    """Draw the DDR5 RAM price ticker in the bottom-left area.
+      y +  0 : "DDR5 16GB 4800/5600  (spot)"   [tiny, dim]
+      y + 22 : "$218.50"                        [large, bright]
+      y + 95 : "24h -$1.25    7d -$4.00"        [small, colored]
+    """
+    draw_text(screen, "DDR5 16GB spot price", fonts["tiny"], TEXT_DIM, x, y)
+
+    if state.ram_price is None:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM, x, y + 28)
+        return
+
+    draw_text(screen, f"${state.ram_price:.2f}", fonts["large"], TEXT_BRIGHT, x, y + 22)
+
+    def delta_str(delta):
+        if delta is None:
+            return "--", TEXT_DIM
+        col = GREEN if delta <= 0 else RED
+        sign = "-" if delta < 0 else "+"
+        return f"{sign}${abs(delta):.2f}", col
+
+    d24_str, d24_col = delta_str(state.ram_delta_24h)
+    d7d_str, d7d_col = delta_str(state.ram_delta_7d)
+
+    draw_text(screen, "24h", fonts["tiny"],    TEXT_DIM, x,       y + 97)
+    draw_text(screen, d24_str, fonts["small"], d24_col,  x + 38,  y + 93)
+    draw_text(screen, "7d",  fonts["tiny"],    TEXT_DIM, x + 160, y + 97)
+    draw_text(screen, d7d_str, fonts["small"], d7d_col,  x + 190, y + 93)
+
 
 def draw_screen(screen, state, fonts, tick):
     screen.fill(BG)
@@ -288,130 +470,129 @@ def draw_screen(screen, state, fonts, tick):
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
 
+        # Last-updated helper (used in multiple sections)
+        def _fmt_upd(ts):
+            if ts == 0:
+                return "never"
+            return datetime.fromtimestamp(ts).strftime("%-I:%M %p")
+
         if not state.weather:
             draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H//2, anchor="center")
-            # MOTD already drawn above; skip the rest of the weather UI
             return
 
         cur, daily = state.weather["current_weather"], state.weather["daily"]
-        # Measure temp width so the icon sits flush to the right of it without overlap
+
+        # Current temp + icon
         temp_str = f"{round(cur['temperature'])}°"
         temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
-        screen.blit(temp_surf, (60, 180))
-        icon_x = 60 + temp_surf.get_width() + 20  # 20px gap after the degrees symbol
-        draw_text(screen, WMO_ICON.get(cur['weathercode'], "☀"), fonts["huge_icon"], GOLD, icon_x, 200)
+        screen.blit(temp_surf, (60, 140))
+        icon_x = 60 + temp_surf.get_width() + 18
+        draw_text(screen, WMO_ICON.get(cur['weathercode'], "☀"), fonts["huge_icon"], GOLD, icon_x, 158)
 
-        # Map Box — no background rect; tiles fill the area directly
-        mx, my, mw, mh = (W//2)-440, 180, 800, 700
-        
-        if state.map_tiles:
-            for (dx, dy), d in state.map_tiles.items():
-                try:
-                    img = pygame.image.load(io.BytesIO(d)).convert_alpha()
-                    screen.blit(img, (mx + (mw-768)//2 + (dx+1)*256, my + (mh-768)//2 + (dy+1)*256))
-                except: pass
-            # Overlay radar: stitch 2×2 zoom-7 tiles → scale 4× to 2048px → crop 768×768
-            if state.radar_tiles and state.radar_crop_rect:
-                try:
-                    stitched = pygame.Surface((512, 512), pygame.SRCALPHA)
-                    for (tdx, tdy), blob in state.radar_tiles.items():
-                        t = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-                        stitched.blit(t, (tdx * 256, tdy * 256))
-                    # Scale 512×512 → 4096×4096 (8×) so 1 zoom-10 tile = 256px,
-                    # matching the basemap tile resolution exactly.
-                    rd = pygame.transform.scale(stitched, (4096, 4096))
-                    cx, cy, cw, ch = state.radar_crop_rect
-                    # Safety clamp to avoid subsurface out-of-bounds
-                    cx = max(0, min(cx, 4096 - cw))
-                    cy = max(0, min(cy, 4096 - ch))
-                    crop = rd.subsurface(pygame.Rect(cx, cy, cw, ch)).copy()
-                    crop.set_alpha(180)
-                    screen.blit(crop, (mx + (mw-768)//2, my + (mh-768)//2))
-                except Exception as e:
-                    print(f"Radar draw error: {e}")
-            pygame.draw.circle(screen, ACCENT, (mx+mw//2 + LOC_DOT_OFFSET[0], my+mh//2 + LOC_DOT_OFFSET[1]), 8, 2)
-        
+
+        # Map box
+        mx, my, mw, mh = 520, 140, 820, 720
+        draw_map(screen, state, fonts, mx, my, mw, mh)
+
         # 7-Day Forecast
-        # Box is 380×95 px starting at (W-420, ry).
-        # Columns: icon(left) | day+desc(mid-left) | hi/lo(mid-right) | precip(right)
         for i in range(7):
-            ry = 180 + (i * 105)
-            pygame.draw.rect(screen, PANEL, (W-420, ry, 380, 95), border_radius=15)
+            ry = 140 + (i * 120)
+            pygame.draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
             dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
             code = daily["weathercode"][i]
-            # Weather icon — far left, vertically centered in box
-            draw_text(screen, WMO_ICON.get(code, "☀"), fonts["icon"], GOLD, W-415, ry+24)
-            # Day name + description stacked in second column
-            draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-365, ry+10)
+            draw_text(screen, WMO_ICON.get(code, "☀"), fonts["icon"], GOLD, W-422, ry+28)
+            draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
             desc = WMO_DESC.get(code, "")
-            draw_text(screen, desc, fonts["tiny"], ACCENT, W-365, ry+48)
-            # High / Low temps — third column
-            hi = round(daily["temperature_2m_max"][i])
-            lo = round(daily["temperature_2m_min"][i])
-            draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-185, ry+8)
-            draw_text(screen, f"{lo}°", fonts["small"], TEXT_DIM,    W-185, ry+50)
-            # Precipitation — rightmost column, right-aligned to box inner edge
+            draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
+            hi_raw = round(daily["temperature_2m_max"][i])
+            lo_raw = round(daily["temperature_2m_min"][i])
+            nws = state.nws_hilo.get(daily["time"][i])
+            hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
+            lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
+            draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+10)
+            draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+55)
             precip_mm = daily["precipitation_sum"][i]
             precip_in = precip_mm / 25.4
             if precip_in > 0.01:
-                draw_text(screen, f"~{precip_in:.2f}\"", fonts["tiny"], RAIN, W-48, ry+36, anchor="topright")
+                draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-50, ry+40, anchor="topright")
             else:
-                draw_text(screen, "Dry", fonts["tiny"], TEXT_DIM, W-48, ry+36, anchor="topright")
+                draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-50, ry+40, anchor="topright")
 
-    draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H-80, anchor="center")
+        # RAM price widget — bottom left
+        draw_ram_widget(screen, state, fonts, 60, 870)
 
-    # Cycle MOTD every 30 seconds through the pool
+        # All "updated at" timestamps — bottom-right corner, stacked above MOTD
+        draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, H-82, anchor="topright")
+        draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, H-60, anchor="topright")
+        draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",     fonts["tiny"], TEXT_DIM, W-20, H-38, anchor="topright")
+
+    draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H-40, anchor="center")
+
+    # Cycle MOTD every 30 seconds
     now = time.time()
     if state.motd_pool and now - state.motd_last_cycle > 30:
         state.motd_index = (state.motd_index + 1) % len(state.motd_pool)
         state.motd = state.motd_pool[state.motd_index]
         state.motd_last_cycle = now
+
+
 def main():
     pygame.init()
-    # Explicitly using the framebuffer or X11 surface
-    screen = pygame.display.set_mode((1920, 1080), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
     pygame.mouse.set_visible(False)
 
     f_p = "dejavusans"
     fonts = {
-        "huge": pygame.font.SysFont(f_p, 200, True),
-        "huge_icon": pygame.font.SysFont(f_p, 150),
-        "large": pygame.font.SysFont(f_p, 65, True),
-        "medium": pygame.font.SysFont(f_p, 40),
-        "small": pygame.font.SysFont(f_p, 30),
-        "tiny": pygame.font.SysFont(f_p, 20),
-        "icon": pygame.font.SysFont(f_p, 46)
+        "huge":      pygame.font.SysFont(f_p, 160, True),
+        "huge_icon": pygame.font.SysFont(f_p, 130),
+        "large":     pygame.font.SysFont(f_p, 65, True),
+        "medium":    pygame.font.SysFont(f_p, 40),
+        "small":     pygame.font.SysFont(f_p, 30),
+        "tiny":      pygame.font.SysFont(f_p, 20),
+        "icon":      pygame.font.SysFont(f_p, 46),
     }
 
     state = AppState()
-    # Start weather fetch immediately; delay map fetch by 5 s without blocking the main thread
+
     threading.Thread(target=state.update_weather, daemon=True).start()
-    state.last_weather_upd = time.time()  # Prevent main loop from re-triggering before first fetch lands
-    state.last_map_upd = time.time()      # Same for map — first update fires after 10 min or on flag clear
+    state.last_weather_upd = time.time()
+    state.last_map_upd = time.time()
+    state.last_ram_upd = time.time()
 
     def _delayed_map_start():
         time.sleep(5)
-        state.update_map()  # Uses _map_running guard properly
+        state.update_map()
+
+    def _delayed_ram_start():
+        time.sleep(8)
+        state.update_ram()
 
     threading.Thread(target=_delayed_map_start, daemon=True).start()
+    threading.Thread(target=_delayed_ram_start, daemon=True).start()
 
     clock, tick = pygame.time.Clock(), 0
     while True:
         for e in pygame.event.get():
             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_q):
-                pygame.quit(); sys.exit()
-        
+                pygame.quit()
+                sys.exit()
+
         now = time.time()
         if now - state.last_weather_upd > 900 and not state._weather_running:
-            state.last_weather_upd = now  # Prevent re-trigger until this fetch completes
+            state.last_weather_upd = now
             threading.Thread(target=state.update_weather, daemon=True).start()
         if now - state.last_map_upd > 600 and not state._map_running:
             state.last_map_upd = now
             threading.Thread(target=state.update_map, daemon=True).start()
+        if now - state.last_ram_upd > 6 * 3600 and not state._ram_running:
+            state.last_ram_upd = now
+            threading.Thread(target=state.update_ram, daemon=True).start()
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()
-        clock.tick(10) # 10 FPS is plenty and saves GPU
+        clock.tick(10)
         tick += 1
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
