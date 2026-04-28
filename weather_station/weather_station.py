@@ -509,14 +509,15 @@ def draw_screen(screen, state, fonts, tick):
             nws = state.nws_hilo.get(daily["time"][i])
             hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
             lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
-            draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+10)
-            draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+55)
+            draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
+            draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+52)
+            # Precipitation on its own bottom row, right-aligned — no overlap with desc or lo temp
             precip_mm = daily["precipitation_sum"][i]
             precip_in = precip_mm / 25.4
             if precip_in > 0.01:
-                draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-50, ry+40, anchor="topright")
+                draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-45, ry+78, anchor="topright")
             else:
-                draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-50, ry+40, anchor="topright")
+                draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
 
         # RAM price widget — bottom left
         draw_ram_widget(screen, state, fonts, 60, 870)
@@ -578,7 +579,7 @@ def main():
                 sys.exit()
 
         now = time.time()
-        if now - state.last_weather_upd > 900 and not state._weather_running:
+        if now - state.last_weather_upd > 60 and not state._weather_running:
             state.last_weather_upd = now
             threading.Thread(target=state.update_weather, daemon=True).start()
         if now - state.last_map_upd > 600 and not state._map_running:
