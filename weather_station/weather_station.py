@@ -555,7 +555,7 @@ def draw_screen(screen, state, fonts, tick):
         draw_map(screen, state, fonts, mx, my, mw, mh)
 
         # Wind widget — centered below the map
-        draw_wind_widget(screen, state, fonts, mx + mw // 2, my + mh + 110)
+        draw_wind_widget(screen, state, fonts, mx + mw // 2, my + mh + 60)
 
         # 7-Day Forecast
         for i in range(7):
@@ -585,12 +585,18 @@ def draw_screen(screen, state, fonts, tick):
         # RAM price widget — bottom left
         draw_ram_widget(screen, state, fonts, 60, 870)
 
-        # All "updated at" timestamps — bottom-right corner, stacked above MOTD
-        draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, H-82, anchor="topright")
-        draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, H-60, anchor="topright")
-        draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",     fonts["tiny"], TEXT_DIM, W-20, H-38, anchor="topright")
+        # All "updated at" timestamps — top-right corner
+        draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, 20, anchor="topright")
+        draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 42, anchor="topright")
+        draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 64, anchor="topright")
 
-    draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H-40, anchor="center")
+    # MOTD — shrink font until it fits within the screen width with padding
+    max_w = W - 80
+    for font_key in ("small", "tiny"):
+        motd_surf = fonts[font_key].render(state.motd, True, GOLD)
+        if motd_surf.get_width() <= max_w:
+            break
+    screen.blit(motd_surf, motd_surf.get_rect(center=(W // 2, H - 40)))
 
     # Cycle MOTD every 30 seconds; refetch a new batch when pool is exhausted
     now = time.time()
