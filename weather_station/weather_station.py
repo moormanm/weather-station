@@ -82,40 +82,19 @@ WIND_DIR = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","
 def _wind_direction(deg):
     return WIND_DIR[round(deg / 22.5) % 16]
 
-def _build_motd_pool(data):
-    cur = data.get("current_weather", {})
-    daily = data.get("daily", {})
-    messages = []
-    temp = cur.get("temperature")
-    if temp is not None:
-        messages.append(f"Currently {round(temp)}\u00b0F.")
-    wind_speed = cur.get("windspeed")
-    wind_dir = cur.get("winddirection")
-    if wind_speed is not None and wind_dir is not None:
-        messages.append(f"Winds {_wind_direction(wind_dir)} at {round(wind_speed)} mph.")
+def _fetch_quote_pool():
+    """Fetch a batch of inspirational quotes from zenquotes.io.
+    Returns a list of 'quote — author' strings, or empty list on failure."""
     try:
-        hi = round(daily["temperature_2m_max"][0])
-        lo = round(daily["temperature_2m_min"][0])
-        messages.append(f"Today: high {hi}\u00b0F, low {lo}\u00b0F.")
-    except (KeyError, IndexError, TypeError):
-        pass
-    try:
-        precip_mm = daily["precipitation_sum"][0]
-        precip_in = precip_mm / 25.4
-        if precip_in > 0.01:
-            messages.append(f"{precip_in:.2f}\" of rain expected today.")
-        else:
-            messages.append("No precipitation expected today.")
-    except (KeyError, IndexError, TypeError):
-        pass
-    try:
-        code = cur.get("weathercode")
-        desc = WMO_DESC.get(code)
-        if desc:
-            messages.append(f"Conditions: {desc}.")
-    except Exception:
-        pass
-    return messages if messages else ["Loading weather..."]
+        raw = safe_fetch("https://zenquotes.io/api/quotes", timeout=10)
+        if raw and raw != "RATE_LIMITED":
+            quotes = json.loads(raw.decode())
+            result = [f"{q['q'].strip()} — {q['a']}" for q in quotes if q.get("q") and q.get("a")]
+            if result:
+                return result
+    except Exception as e:
+        print(f"Quote fetch error: {e}")
+    return []
 
 
 def safe_fetch(url, timeout=15):
@@ -234,10 +213,11 @@ class AppState:
         self.last_map_upd = 0
         self.last_ram_upd = 0
         self.backoff_until = 0
-        self.motd = "Fetching weather..."
+        self.motd = "Loading..."
         self.motd_pool = []
         self.motd_index = 0
         self.motd_last_cycle = 0
+        self._quotes_running = False
         # RAM price state
         self.ram_price = None           # current price
         self.ram_pct = None             # % change from DRAM Exchange
@@ -268,7 +248,6 @@ class AppState:
         raw = safe_fetch(url)
         if raw == "RATE_LIMITED":
             self.backoff_until = time.time() + 1800
-            self.motd = "Weather service busy. Retrying later..."
             return
         if raw:
             try:
@@ -278,9 +257,6 @@ class AppState:
                     self.weather = data
                     self.nws_hilo = nws_hilo
                     self.last_weather_upd = time.time()
-                    self.motd_pool = _build_motd_pool(data)
-                    self.motd_index = 0
-                    self.motd = self.motd_pool[0]
             except Exception as e:
                 print(f"Weather parse error: {e}")
                 self.last_weather_upd = 0
@@ -333,8 +309,12 @@ class AppState:
                     for dx in range(-1, 2):
                         radar_url = f"{host}{path}/256/{zoom}/{xt+dx}/{yt+dy}/6/1_1.png"
                         raw = safe_fetch(radar_url, timeout=10)
-                        if raw and raw != "RATE_LIMITED" and len(raw) > 300:
-                            new_radar_tiles[(dx, dy)] = raw
+                        if raw and raw != "RATE_LIMITED":
+                            if raw[:4] == b'\x89PNG':
+                                new_radar_tiles[(dx, dy)] = raw
+                            else:
+                                print(f"Radar tile ({dx},{dy}) not PNG: {raw[:120]}")
+                            # else: transparent/empty tile, skip silently
             except Exception as e:
                 print(f"Radar fetch error: {e}")
 
@@ -394,6 +374,27 @@ class AppState:
             self.ram_delta_7d = delta_7d
             self.last_ram_upd = now
 
+    # ── Quotes ────────────────────────────────────────────────────────────────
+    def update_quotes(self):
+        if self._quotes_running:
+            return
+        self._quotes_running = True
+        try:
+            import random
+            pool = _fetch_quote_pool()
+            if not pool:
+                return
+            random.shuffle(pool)
+            start = random.randrange(len(pool))
+            with self.lock:
+                self.motd_pool = pool
+                self.motd_index = start
+                self.motd = pool[start]
+                self.motd_last_cycle = time.time()
+        except Exception as e:
+            print(f"Quote pool update error: {e}")
+        finally:
+            self._quotes_running = False
 
 # ── UI Rendering ──────────────────────────────────────────────────────────────
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
@@ -440,6 +441,55 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
     tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
     screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
+
+
+def draw_wind_widget(screen, state, fonts, cx, cy):
+    """Compass rose with arrow pointing toward where wind is going.
+    cx, cy = center of circle."""
+    RADIUS = 52
+
+    pygame.draw.circle(screen, PANEL, (cx, cy), RADIUS)
+    pygame.draw.circle(screen, TEXT_DIM, (cx, cy), RADIUS, 1)
+
+    # Cardinal labels — placed just inside the rim
+    for label, sx, sy in (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("W", -1, 0)):
+        lx = cx + int((RADIUS - 12) * sx)
+        ly = cy + int((RADIUS - 12) * sy)
+        draw_text(screen, label, fonts["tiny"], TEXT_DIM, lx, ly, anchor="center")
+
+    cur = state.weather["current_weather"] if state.weather else None
+    if cur is None:
+        draw_text(screen, "Wind", fonts["tiny"], TEXT_DIM, cx, cy + RADIUS + 8, anchor="center")
+        return
+
+    speed_kmh = cur.get("windspeed", 0)
+    speed_mph = speed_kmh * 0.621371
+    direction = cur.get("winddirection", 0)  # meteorological: wind coming FROM this bearing
+
+    # Arrow tip points FROM where wind originates (i.e. toward that compass direction)
+    # e.g. SW wind (225°) -> arrow tip points toward SW
+    from_rad = math.radians(direction)
+    arrow_len = RADIUS - 22   # shorter, tighter
+    head_len  = 9
+
+    tip_x  = cx + int(arrow_len * math.sin(from_rad))
+    tip_y  = cy - int(arrow_len * math.cos(from_rad))
+    tail_x = cx - int(arrow_len * math.sin(from_rad))
+    tail_y = cy + int(arrow_len * math.cos(from_rad))
+
+    pygame.draw.line(screen, ACCENT, (tail_x, tail_y), (tip_x, tip_y), 2)
+    for side in (+1, -1):
+        wing_rad = from_rad + side * math.radians(145)
+        pygame.draw.line(screen, ACCENT, (tip_x, tip_y),
+                         (tip_x + int(head_len * math.sin(wing_rad)),
+                          tip_y - int(head_len * math.cos(wing_rad))), 2)
+
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    compass = dirs[round(direction / 22.5) % 16]
+
+    draw_text(screen, f"{round(speed_mph)} mph", fonts["tiny"], TEXT_BRIGHT, cx, cy + RADIUS + 8,  anchor="center")
+    draw_text(screen, compass,                   fonts["tiny"], TEXT_DIM,    cx, cy + RADIUS + 26, anchor="center")
 
 
 def draw_ram_widget(screen, state, fonts, x, y):
@@ -504,6 +554,9 @@ def draw_screen(screen, state, fonts, tick):
         mx, my, mw, mh = 520, 140, 820, 720
         draw_map(screen, state, fonts, mx, my, mw, mh)
 
+        # Wind widget — centered below the map
+        draw_wind_widget(screen, state, fonts, mx + mw // 2, my + mh + 110)
+
         # 7-Day Forecast
         for i in range(7):
             ry = 140 + (i * 120)
@@ -539,12 +592,17 @@ def draw_screen(screen, state, fonts, tick):
 
     draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H-40, anchor="center")
 
-    # Cycle MOTD every 30 seconds
+    # Cycle MOTD every 30 seconds; refetch a new batch when pool is exhausted
     now = time.time()
     if state.motd_pool and now - state.motd_last_cycle > 30:
-        state.motd_index = (state.motd_index + 1) % len(state.motd_pool)
-        state.motd = state.motd_pool[state.motd_index]
-        state.motd_last_cycle = now
+        next_index = state.motd_index + 1
+        if next_index >= len(state.motd_pool):
+            # Pool exhausted — fetch a fresh batch in the background
+            threading.Thread(target=state.update_quotes, daemon=True).start()
+        else:
+            state.motd_index = next_index
+            state.motd = state.motd_pool[state.motd_index]
+            state.motd_last_cycle = now
 
 
 def main():
@@ -566,6 +624,7 @@ def main():
     state = AppState()
 
     threading.Thread(target=state.update_weather, daemon=True).start()
+    threading.Thread(target=state.update_quotes,  daemon=True).start()
     state.last_weather_upd = time.time()
     state.last_map_upd = time.time()
     state.last_ram_upd = time.time()
