@@ -45,6 +45,7 @@ NWS_FORECAST_URL = "https://api.weather.gov/gridpoints/LWX/80,95/forecast"
 NWS_STATIONS_URL = "https://api.weather.gov/stations/KFDK/observations?limit=24"
 TILE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "weather_station_tiles")
 os.makedirs(TILE_CACHE_DIR, exist_ok=True)
+RAM_HISTORY_FILE = os.path.join(TILE_CACHE_DIR, "ram_price_history.json")
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BG, PANEL = (10, 14, 26), (18, 24, 42)
@@ -359,23 +360,32 @@ class AppState:
             return
         now = time.time()
         history = _load_ram_history()
-        history.append({"ts": now, "price": price})
-        # Keep only last 10 days of entries
+
+        # Deduplicate by calendar date — keep only one entry per day (latest fetch)
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        if history and datetime.fromtimestamp(history[-1]["ts"]).strftime("%Y-%m-%d") == today_str:
+            history[-1] = {"ts": now, "price": price}
+        else:
+            history.append({"ts": now, "price": price})
+
+        # Keep only last 10 days
         cutoff = now - 10 * 86400
         history = [e for e in history if e["ts"] >= cutoff]
         _save_ram_history(history)
 
-        # Find deltas: most recent entry older than 24h and 7d
-        delta_24h = None
-        delta_7d = None
-        for entry in reversed(history[:-1]):  # skip the entry we just appended
-            age = now - entry["ts"]
-            if delta_24h is None and age >= 20 * 3600:  # at least 20h old = "yesterday"
-                delta_24h = price - entry["price"]
-            if delta_7d is None and age >= 6 * 86400:   # at least 6d old = "last week"
-                delta_7d = price - entry["price"]
-            if delta_24h is not None and delta_7d is not None:
-                break
+        # Build date -> price map (latest entry per date wins)
+        by_date = {}
+        for e in history:
+            d = datetime.fromtimestamp(e["ts"]).strftime("%Y-%m-%d")
+            by_date[d] = e["price"]
+
+        from datetime import date as _date, timedelta as _timedelta
+        today = _date.today()
+        yesterday = (today - _timedelta(days=1)).isoformat()
+        week_ago  = (today - _timedelta(days=7)).isoformat()
+
+        delta_24h = (price - by_date[yesterday]) if yesterday in by_date else None
+        delta_7d  = (price - by_date[week_ago])  if week_ago  in by_date else None
 
         with self.lock:
             self.ram_price = price
@@ -582,10 +592,10 @@ def main():
         if now - state.last_weather_upd > 60 and not state._weather_running:
             state.last_weather_upd = now
             threading.Thread(target=state.update_weather, daemon=True).start()
-        if now - state.last_map_upd > 600 and not state._map_running:
+        if now - state.last_map_upd > 60 and not state._map_running:
             state.last_map_upd = now
             threading.Thread(target=state.update_map, daemon=True).start()
-        if now - state.last_ram_upd > 6 * 3600 and not state._ram_running:
+        if now - state.last_ram_upd > 60 and not state._ram_running:
             state.last_ram_upd = now
             threading.Thread(target=state.update_ram, daemon=True).start()
 
