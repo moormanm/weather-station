@@ -19,8 +19,12 @@ import io
 from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
+# LATITUDE, LONGITUDE = 38.395392,  -75.1557415
+# LOCATION_NAME = "Ocean Pines, MD"
+
 LATITUDE, LONGITUDE = 39.4662, -77.4068
 LOCATION_NAME = "Frederick, MD"
+
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
 
@@ -55,15 +59,15 @@ GREEN, RED = (60, 220, 100), (220, 70, 70)
 
 # Icons: only codepoints confirmed in DejaVu Sans on Raspberry Pi OS
 # U+2600 ☀  U+2601 ☁  U+2602 ☂  U+2603 ☃  — always present
-WMO_ICON = {
-    0:"☀",  1:"☀",  2:"☁",  3:"☁",
-    45:"☂", 48:"☂",
-    51:"☂", 53:"☂", 55:"☂",
-    61:"☂", 63:"☂", 65:"☂",
-    71:"☃", 73:"☃", 75:"☃", 77:"☃",
-    80:"☂", 81:"☂", 82:"☂",
-    85:"☃", 86:"☃",
-    95:"☂", 96:"☂", 99:"☂",
+WMO_ICON_TYPE = {
+    0:"sun",       1:"sun",       2:"cloud",     3:"cloud",
+    45:"cloud",    48:"cloud",
+    51:"rain",     53:"rain",     55:"rain",
+    61:"rain",     63:"rain",     65:"rain",
+    71:"snow",     73:"snow",     75:"snow",     77:"snow",
+    80:"rain",     81:"rain",     82:"rain",
+    85:"snow",     86:"snow",
+    95:"thunder",  96:"thunder",  99:"thunder",
 }
 WMO_DESC = {
     0:"Clear sky",       1:"Mainly clear",    2:"Partly cloudy",   3:"Overcast",
@@ -81,6 +85,118 @@ WIND_DIR = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","
 
 def _wind_direction(deg):
     return WIND_DIR[round(deg / 22.5) % 16]
+
+def _cloud_circles(size):
+    """Return list of (ox, oy, r) puff definitions for a cloud of given size."""
+    s = size
+    return [
+        ( 0.00*s, -0.08*s,  0.32*s),   # top center — tallest puff
+        (-0.28*s,  0.04*s,  0.24*s),   # top left
+        ( 0.28*s,  0.04*s,  0.24*s),   # top right
+        (-0.42*s,  0.22*s,  0.18*s),   # bottom left edge
+        ( 0.42*s,  0.22*s,  0.18*s),   # bottom right edge
+        (-0.14*s,  0.18*s,  0.22*s),   # bottom left center
+        ( 0.14*s,  0.18*s,  0.22*s),   # bottom right center
+    ]
+
+def _draw_cloud_on(surf, cx, cy, size, color):
+    """Draw a smooth filled cloud onto surf at (cx,cy)."""
+    for ox, oy, r in _cloud_circles(size):
+        pygame.draw.circle(surf, color, (int(cx+ox), int(cy+oy)), int(r))
+
+def draw_weather_icon(surf, code, cx, cy, size, color):
+    """Draw a detailed weather icon as pygame primitives.
+    cx, cy = center; size = nominal half-width of bounding box."""
+    kind  = WMO_ICON_TYPE.get(code, "sun")
+    lw    = max(2, size // 20)
+    small = size < 60
+
+    # Render onto a 2× SRCALPHA surface then scale down for smooth edges
+    scale = 2
+    S     = size * scale
+    pad   = S + 10
+    tmp   = pygame.Surface((pad*2, pad*2), pygame.SRCALPHA)
+    tc    = (pad, pad)   # center on tmp surface
+
+    if kind == "sun":
+        core_r  = int(S * 0.30)
+        inner_r = core_r + max(3, S // 12)
+        outer_r = core_r + int(S * 0.32)
+        hw      = max(3, S // 18)
+        # Rays first so core covers ray bases
+        for i in range(8):
+            angle = math.radians(i * 45)
+            perp  = angle + math.pi / 2
+            bx = tc[0] + int(math.cos(angle) * inner_r)
+            by = tc[1] + int(math.sin(angle) * inner_r)
+            tx = tc[0] + int(math.cos(angle) * outer_r)
+            ty = tc[1] + int(math.sin(angle) * outer_r)
+            p1 = (bx + int(math.cos(perp)*hw), by + int(math.sin(perp)*hw))
+            p2 = (bx - int(math.cos(perp)*hw), by - int(math.sin(perp)*hw))
+            pygame.draw.polygon(tmp, color, [p1, p2, (tx, ty)])
+        pygame.draw.circle(tmp, color, tc, core_r)
+
+    elif kind == "cloud":
+        _draw_cloud_on(tmp, tc[0], tc[1], S * 0.90, color)
+
+    elif kind == "rain":
+        cloud_cy = tc[1] - int(S * 0.10)
+        _draw_cloud_on(tmp, tc[0], cloud_cy, S * 0.78, color)
+        # Rain drops: staggered rows, angled
+        cols     = 3 if small else 5
+        spacingx = int(S * 0.22)
+        start_x  = tc[0] - spacingx * (cols // 2)
+        drop_top = tc[1] + int(S * 0.22)
+        drop_len = int(S * 0.28)
+        slant    = int(S * 0.08)
+        droplw   = max(2, lw * scale - 1)
+        for i in range(cols):
+            x  = start_x + i * spacingx
+            yo = int(S * 0.13) if i % 2 == 1 else 0
+            pygame.draw.line(tmp, color,
+                             (x,         drop_top + yo),
+                             (x + slant, drop_top + yo + drop_len), droplw)
+
+    elif kind == "snow":
+        cloud_cy = tc[1] - int(S * 0.10)
+        _draw_cloud_on(tmp, tc[0], cloud_cy, S * 0.78, color)
+        # Proper snowflake
+        fx, fy   = tc[0], tc[1] + int(S * 0.30)
+        arm      = int(S * 0.22)
+        tick     = int(S * 0.09)
+        flw      = max(2, lw * scale - 1)
+        for deg in range(0, 360, 60):
+            rad  = math.radians(deg)
+            ex   = fx + int(math.cos(rad) * arm)
+            ey   = fy + int(math.sin(rad) * arm)
+            pygame.draw.line(tmp, color, (fx, fy), (ex, ey), flw)
+            if not small:
+                for frac in (0.45, 0.75):
+                    tx   = fx + int(math.cos(rad) * arm * frac)
+                    ty   = fy + int(math.sin(rad) * arm * frac)
+                    perp = rad + math.pi / 2
+                    pygame.draw.line(tmp, color,
+                        (int(tx - math.cos(perp)*tick), int(ty - math.sin(perp)*tick)),
+                        (int(tx + math.cos(perp)*tick), int(ty + math.sin(perp)*tick)), flw)
+
+    elif kind == "thunder":
+        cloud_cy = tc[1] - int(S * 0.12)
+        _draw_cloud_on(tmp, tc[0], cloud_cy, S * 0.76, color)
+        # Lightning bolt
+        bx, by = tc[0] + int(S*0.04), tc[1] + int(S*0.08)
+        bolt = [
+            (bx + int(S*0.12), by),
+            (bx - int(S*0.02), by + int(S*0.24)),
+            (bx + int(S*0.07), by + int(S*0.24)),
+            (bx - int(S*0.14), by + int(S*0.52)),
+            (bx + int(S*0.01), by + int(S*0.26)),
+            (bx - int(S*0.07), by + int(S*0.26)),
+        ]
+        pygame.draw.polygon(tmp, color, bolt)
+
+    # Scale down 2× → smooth anti-aliased result
+    out = pygame.transform.smoothscale(tmp, (pad, pad))
+    surf.blit(out, (cx - pad//2, cy - pad//2))
 
 def _fetch_quote_pool():
     """Fetch a batch of inspirational quotes from zenquotes.io.
@@ -546,8 +662,8 @@ def draw_screen(screen, state, fonts, tick):
         temp_str = f"{round(cur['temperature'])}°"
         temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
         screen.blit(temp_surf, (60, 140))
-        icon_x = 60 + temp_surf.get_width() + 18
-        draw_text(screen, WMO_ICON.get(cur['weathercode'], "☀"), fonts["huge_icon"], GOLD, icon_x, 158)
+        icon_x = 60 + temp_surf.get_width() + 18 + 65
+        draw_weather_icon(screen, cur['weathercode'], icon_x, 195, 130, GOLD)
 
 
         # Map box
@@ -563,7 +679,7 @@ def draw_screen(screen, state, fonts, tick):
             pygame.draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
             dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
             code = daily["weathercode"][i]
-            draw_text(screen, WMO_ICON.get(code, "☀"), fonts["icon"], GOLD, W-422, ry+28)
+            draw_weather_icon(screen, code, W-407, ry+55, 46, GOLD)
             draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
             desc = WMO_DESC.get(code, "")
             draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
@@ -618,13 +734,11 @@ def main():
 
     f_p = "dejavusans"
     fonts = {
-        "huge":      pygame.font.SysFont(f_p, 160, True),
-        "huge_icon": pygame.font.SysFont(f_p, 130),
-        "large":     pygame.font.SysFont(f_p, 65, True),
-        "medium":    pygame.font.SysFont(f_p, 40),
-        "small":     pygame.font.SysFont(f_p, 30),
-        "tiny":      pygame.font.SysFont(f_p, 20),
-        "icon":      pygame.font.SysFont(f_p, 46),
+        "huge":   pygame.font.SysFont(f_p, 160, True),
+        "large":  pygame.font.SysFont(f_p, 65, True),
+        "medium": pygame.font.SysFont(f_p, 40),
+        "small":  pygame.font.SysFont(f_p, 30),
+        "tiny":   pygame.font.SysFont(f_p, 20),
     }
 
     state = AppState()

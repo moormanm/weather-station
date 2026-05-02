@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environment
+weather_station/bin/
+weather_station/include/
+weather_station/lib/
+weather_station/lf
+weather_station/pyvenv.cfg
+
+# Tile and data cache
+~/.cache/weather_station_tiles/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
