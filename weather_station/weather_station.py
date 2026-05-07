@@ -339,6 +339,17 @@ class AppState:
         self.ram_pct = None             # % change from DRAM Exchange
         self.ram_delta_24h = None       # dollar diff vs ~24h ago
         self.ram_delta_7d = None        # dollar diff vs ~7d ago
+        # Tide state
+        self.tides = []              # list of {"t": "HH:MM", "v": float, "type": "H"/"L"} for today+tomorrow
+        self.last_tide_upd = 0
+        self._tide_running = False
+        # OSV state
+        self.osv_count = None        # int
+        self.osv_max = 145           # int
+        self.osv_status = None       # str
+        self.osv_reported_at = None  # datetime or None
+        self.last_osv_upd = 0
+        self._osv_running = False
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
@@ -512,6 +523,83 @@ class AppState:
         finally:
             self._quotes_running = False
 
+    # ── Tides ─────────────────────────────────────────────────────────────────
+    def update_tides(self):
+        if self._tide_running:
+            return
+        self._tide_running = True
+        try:
+            self._do_update_tides()
+        finally:
+            self._tide_running = False
+
+    def _do_update_tides(self):
+        from datetime import date as _date, timedelta as _td
+        today    = _date.today().strftime("%Y%m%d")
+        tomorrow = (_date.today() + _td(days=1)).strftime("%Y%m%d")
+        url = (
+            "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
+            f"?station=8570283&product=predictions&datum=MLLW"
+            f"&time_zone=lst_ldt&interval=hilo&units=english"
+            f"&application=weather_station&format=json"
+            f"&begin_date={today}&end_date={tomorrow}"
+        )
+        raw = safe_fetch(url, timeout=15)
+        if not raw or raw == "RATE_LIMITED":
+            return
+        try:
+            data = json.loads(raw.decode())
+            preds = data.get("predictions", [])
+            tides = []
+            for p in preds:
+                tides.append({"t": p["t"], "v": float(p["v"]), "type": p["type"]})
+            with self.lock:
+                self.tides = tides
+                self.last_tide_upd = time.time()
+        except Exception as e:
+            print(f"Tide parse error: {e}")
+
+    # ── OSV ───────────────────────────────────────────────────────────────────
+    def update_osv(self):
+        if self._osv_running:
+            return
+        self._osv_running = True
+        try:
+            self._do_update_osv()
+        finally:
+            self._osv_running = False
+
+    def _do_update_osv(self):
+        raw = safe_fetch("https://osvcount.com/", timeout=15)
+        if not raw or raw == "RATE_LIMITED":
+            return
+        try:
+            html = raw.decode("utf-8", errors="replace")
+            m_count  = re.search(r'id="fn-expired"[^>]*>(\d+)<', html)
+            m_max    = re.search(r'Vehicles on the beach[^/]*/(\d+)', html)
+            m_status = re.search(r'(OSV (?:Open[^<]*|Closed))', html)
+            m_utc    = re.search(r'data-utc="([^"]+)"', html)
+            count  = int(m_count.group(1))  if m_count  else None
+            maxv   = int(m_max.group(1))    if m_max    else 145
+            status = m_status.group(1).strip() if m_status else None
+            reported_at = None
+            if m_utc:
+                try:
+                    from datetime import timezone as _tz
+                    utc_dt = datetime.strptime(m_utc.group(1), "%Y-%m-%dT%H:%M:%SZ")
+                    utc_dt = utc_dt.replace(tzinfo=_tz.utc)
+                    reported_at = utc_dt.astimezone().replace(tzinfo=None)
+                except Exception:
+                    pass
+            with self.lock:
+                self.osv_count       = count
+                self.osv_max         = maxv
+                self.osv_status      = status
+                self.osv_reported_at = reported_at
+                self.last_osv_upd    = time.time()
+        except Exception as e:
+            print(f"OSV parse error: {e}")
+
 # ── UI Rendering ──────────────────────────────────────────────────────────────
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
     img = font.render(str(text), True, color)
@@ -608,6 +696,147 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
     draw_text(screen, compass,                   fonts["tiny"], TEXT_DIM,    cx, cy + RADIUS + 26, anchor="center")
 
 
+def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
+    """Tide sine-curve widget showing today's hi/lo predictions.
+    x,y = top-left corner.  w×h = bounding box."""
+    from datetime import date as _date
+    title_y = y + 4
+    draw_text(screen, "Ocean City Tides", fonts["tiny"], TEXT_DIM, x, title_y)
+
+    tides = state.tides  # today + tomorrow from NOAA
+
+    if not tides:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM, x, y + 30)
+        return
+
+    graph_x = x
+    graph_y = y + 26
+    graph_w = w
+    graph_h = h - 26
+
+    # Background panel
+    pygame.draw.rect(screen, PANEL, (graph_x, graph_y, graph_w, graph_h), border_radius=10)
+
+    def _minutes(t_str):
+        # t_str: "YYYY-MM-DD HH:MM"  — convert to minutes since today midnight
+        from datetime import date as _d2, datetime as _dt2
+        today = _d2.today()
+        dt = _dt2.strptime(t_str, "%Y-%m-%d %H:%M")
+        delta = dt - _dt2.combine(today, _dt2.min.time())
+        return int(delta.total_seconds() / 60)
+
+    sorted_tides = sorted(tides, key=lambda t: _minutes(t["t"]))
+
+    # Value range — use all fetched tides for normalisation
+    all_vals = [t["v"] for t in sorted_tides]
+    vmin = min(all_vals) - 0.3
+    vmax = max(all_vals) + 0.3
+    vrange = max(vmax - vmin, 0.5)
+
+    def _norm(v):
+        return (v - vmin) / vrange  # 0=low, 1=high
+
+    def _px(minutes, norm_v):
+        px = graph_x + int(minutes / 1440 * graph_w)
+        py = graph_y + graph_h - 20 - int(norm_v * (graph_h - 38))
+        return px, py
+
+    # Gridlines at 6-hour marks
+    for hr in range(0, 25, 6):
+        gx = graph_x + int(hr / 24 * graph_w)
+        pygame.draw.line(screen, BG, (gx, graph_y + 4), (gx, graph_y + graph_h - 22), 1)
+        label = f"{hr % 12 or 12}{'a' if hr < 12 else 'p'}"
+        draw_text(screen, label, fonts["tiny"], TEXT_DIM, gx, graph_y + graph_h - 20, anchor="midtop")
+
+    # Build smooth polyline via cosine interpolation between all tide events
+    # (curve continues naturally into tomorrow, graph clips at graph_w)
+    pts_data = [(_minutes(t["t"]), t["v"]) for t in sorted_tides]
+
+    poly = []
+    for i in range(len(pts_data) - 1):
+        m0, v0 = pts_data[i]
+        m1, v1 = pts_data[i + 1]
+        steps = max(int((m1 - m0) / 5), 2)
+        for s in range(steps):
+            frac = s / steps
+            frac_cos = (1 - math.cos(frac * math.pi)) / 2
+            mv = m0 + (m1 - m0) * frac
+            vv = v0 + (v1 - v0) * frac_cos
+            ppx, ppy = _px(mv, _norm(vv))
+            if ppx > graph_x + graph_w:
+                break
+            poly.append((ppx, ppy))
+
+    if len(poly) >= 2:
+        pygame.draw.lines(screen, ACCENT, False, poly, 2)
+
+    # Mark only today's hi/lo events — one combined label each
+    today_tides = [t for t in sorted_tides if 0 <= _minutes(t["t"]) < 1440]
+    for t in today_tides:
+        m = _minutes(t["t"])
+        n = _norm(t["v"])
+        px, py = _px(m, n)
+        is_high = t["type"] == "H"
+        color = TEXT_BRIGHT if is_high else RAIN
+        pygame.draw.circle(screen, color, (px, py), 5)
+        # e.g. "H 3.2ft 10:24a"
+        t_hm   = t["t"].split(" ")[1]
+        hh, mm = int(t_hm.split(":")[0]), int(t_hm.split(":")[1])
+        ampm   = "a" if hh < 12 else "p"
+        h12    = hh % 12 or 12
+        t_fmt  = f"{h12}:{mm:02d}{ampm}"
+        lbl    = f"{'H' if is_high else 'L'} {t['v']:.1f}ft {t_fmt}"
+        offset_y = -14 if is_high else 8
+        draw_text(screen, lbl, fonts["tiny"], color, px, py + offset_y, anchor="center")
+
+    # Now-marker
+    now_min = datetime.now().hour * 60 + datetime.now().minute
+    nx = graph_x + int(now_min / 1440 * graph_w)
+    pygame.draw.line(screen, GOLD, (nx, graph_y + 4), (nx, graph_y + graph_h - 22), 2)
+
+
+def draw_osv_widget(screen, state, fonts, x, y, w=480):
+    """Off-Street Vehicle count widget for Assateague Island beach.
+    x,y = top-left corner."""
+    draw_text(screen, "Assateague OSV Count", fonts["tiny"], TEXT_DIM, x, y + 4)
+
+    osv_max    = state.osv_max or 145
+    osv_count  = state.osv_count
+    osv_status = state.osv_status
+    reported   = state.osv_reported_at
+
+    bar_x = x
+    bar_y = y + 28
+    bar_w = w
+    bar_h = 28
+
+    if osv_count is None:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM, x, bar_y)
+        return
+
+    # Fill bar
+    fill_frac = min(osv_count / osv_max, 1.0)
+    fill_color = GREEN if fill_frac < 0.7 else (GOLD if fill_frac < 0.9 else RED)
+    pygame.draw.rect(screen, PANEL, (bar_x, bar_y, bar_w, bar_h), border_radius=6)
+    if fill_frac > 0:
+        pygame.draw.rect(screen, fill_color, (bar_x, bar_y, int(bar_w * fill_frac), bar_h), border_radius=6)
+    pygame.draw.rect(screen, TEXT_DIM, (bar_x, bar_y, bar_w, bar_h), 1, border_radius=6)
+
+    # Count / max text — vertically centered in bar
+    draw_text(screen, f"{osv_count} / {osv_max}", fonts["small"], TEXT_BRIGHT, x + bar_w // 2, bar_y + bar_h // 2, anchor="center")
+
+    # Status line
+    if osv_status:
+        status_short = osv_status.replace("OSV ", "")
+        status_col   = GREEN if "Open" in osv_status else RED
+        draw_text(screen, status_short, fonts["small"], status_col, x, bar_y + bar_h + 6)
+
+    # Reported-at timestamp
+    if reported:
+        ts_str = reported.strftime("%-I:%M %p")
+        draw_text(screen, f"as of {ts_str}", fonts["tiny"], TEXT_DIM, x + w, bar_y + bar_h + 8, anchor="topright")
+
+
 def draw_ram_widget(screen, state, fonts, x, y):
     """Draw the DDR5 RAM price ticker in the bottom-left area.
       y +  0 : "DDR5 16GB 4800/5600  (spot)"   [tiny, dim]
@@ -701,10 +930,18 @@ def draw_screen(screen, state, fonts, tick):
         # RAM price widget — bottom left
         draw_ram_widget(screen, state, fonts, 60, 870)
 
+        # Tide widget — left column, below current temp
+        draw_tide_widget(screen, state, fonts, 80, 370, w=440, h=230)
+
+        # OSV widget — left column, below tides
+        draw_osv_widget(screen, state, fonts, 80, 630, w=440)
+
         # All "updated at" timestamps — top-right corner
         draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, 20, anchor="topright")
         draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 42, anchor="topright")
         draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 64, anchor="topright")
+        draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}",    fonts["tiny"], TEXT_DIM, W-20, 86, anchor="topright")
+        draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 108, anchor="topright")
 
     # MOTD — shrink font until it fits within the screen width with padding
     max_w = W - 80
@@ -757,8 +994,18 @@ def main():
         time.sleep(8)
         state.update_ram()
 
-    threading.Thread(target=_delayed_map_start, daemon=True).start()
-    threading.Thread(target=_delayed_ram_start, daemon=True).start()
+    def _delayed_tide_start():
+        time.sleep(3)
+        state.update_tides()
+
+    def _delayed_osv_start():
+        time.sleep(6)
+        state.update_osv()
+
+    threading.Thread(target=_delayed_map_start,  daemon=True).start()
+    threading.Thread(target=_delayed_ram_start,  daemon=True).start()
+    threading.Thread(target=_delayed_tide_start, daemon=True).start()
+    threading.Thread(target=_delayed_osv_start,  daemon=True).start()
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -777,6 +1024,12 @@ def main():
         if now - state.last_ram_upd > 60 and not state._ram_running:
             state.last_ram_upd = now
             threading.Thread(target=state.update_ram, daemon=True).start()
+        if now - state.last_tide_upd > 3600 and not state._tide_running:
+            state.last_tide_upd = now
+            threading.Thread(target=state.update_tides, daemon=True).start()
+        if now - state.last_osv_upd > 60 and not state._osv_running:
+            state.last_osv_upd = now
+            threading.Thread(target=state.update_osv, daemon=True).start()
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()
