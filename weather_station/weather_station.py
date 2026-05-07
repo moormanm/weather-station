@@ -19,11 +19,11 @@ import io
 from datetime import datetime
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-# LATITUDE, LONGITUDE = 38.395392,  -75.1557415
-# LOCATION_NAME = "Ocean Pines, MD"
+LATITUDE, LONGITUDE = 38.395392,  -75.1557415
+LOCATION_NAME = "Ocean Pines, MD"
 
-LATITUDE, LONGITUDE = 39.4662, -77.4068
-LOCATION_NAME = "Frederick, MD"
+# LATITUDE, LONGITUDE = 39.4662, -77.4068
+# LOCATION_NAME = "Frederick, MD"
 
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
