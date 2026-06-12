@@ -1,3 +1,3 @@
-apt-get update
-apt-get install pygame
+sudo apt-get update
+sudo apt-get install pygame
 cp weather_station.desktop ~/.config/autostart 
