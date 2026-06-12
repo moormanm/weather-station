@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+
+
 # Hide mouse cursor immediately
 unclutter -idle 0 &
 
@@ -14,4 +16,7 @@ fi
 
 # Launch weather station
 cd "/home/pi/weather_station"
-exec /usr/bin/python3 "/home/pi/weather_station/weather_station.py"
+# get latest
+git pull
+
+exec /usr/bin/python3 "/home/pi/weather_station/weather_station/weather_station.py"
