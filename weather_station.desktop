@@ -1,5 +1,5 @@
 [Desktop Entry]
 Type=Application
 Name=Weather Station
-Exec=/home/pi/weather_station/launch.sh
+Exec=/home/pi/weather-station/launch.sh
 X-GNOME-Autostart-enabled=true
