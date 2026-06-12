@@ -18,12 +18,22 @@ import re
 import io
 from datetime import datetime
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-LATITUDE, LONGITUDE = 38.395392,  -75.1557415
-LOCATION_NAME = "Ocean Pines, MD"
 
-# LATITUDE, LONGITUDE = 39.4662, -77.4068
-# LOCATION_NAME = "Frederick, MD"
+from configparser import ConfigParser
+from pathlib import Path
+
+config_path = Path("~/ws-settings.ini").expanduser()
+
+if not config_path.exists():
+    raise FileNotFoundError(f"Config file not found at: {config_path}")
+
+
+config = ConfigParser()
+config.read(config_path)
+
+LATITUDE = config.getfloat("LOCATION", "LATITUDE")
+LONGITUDE = config.getfloat("LOCATION", "LONGITUDE")
+LOCATION_NAME = config.get("LOCATION", "NAME")
 
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
