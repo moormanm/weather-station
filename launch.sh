@@ -19,4 +19,4 @@ cd "/home/pi/weather_station"
 # get latest
 git pull
 
-exec /usr/bin/python3 "/home/pi/weather_station/weather_station.py"
+exec /usr/bin/python3 "/home/pi/weather-station/weather_station.py"
