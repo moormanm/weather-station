@@ -4,11 +4,11 @@ __pycache__/
 *.pyo
 
 # Virtual environment
-weather_station/bin/
-weather_station/include/
-weather_station/lib/
-weather_station/lf
-weather_station/pyvenv.cfg
+bin/
+include/
+lib/
+lf
+pyvenv.cfg
 
 # Tile and data cache
 ~/.cache/weather_station_tiles/
