@@ -35,6 +35,12 @@ LATITUDE = config.getfloat("LOCATION", "LATITUDE")
 LONGITUDE = config.getfloat("LOCATION", "LONGITUDE")
 LOCATION_NAME = config.get("LOCATION", "NAME")
 
+FEATURES = {
+    "OSV_COUNT": config.getboolean("FEATURES", "OSV_COUNT", fallback=False),
+    "OSV_TIDES": config.getboolean("FEATURES", "OSV_TIDES", fallback=False),
+    "RAM_PRICE": config.getboolean("FEATURES", "RAM_PRICE", fallback=False),
+}
+
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
 
@@ -212,7 +218,7 @@ def _fetch_quote_pool():
     """Fetch a batch of inspirational quotes from zenquotes.io.
     Returns a list of 'quote — author' strings, or empty list on failure."""
     try:
-        raw = safe_fetch("https://zenquotes.io/api/quotes", timeout=10)
+        raw = safe_fetch("https://zenquotes.io/api/quotes", timeout=30)
         if raw and raw != "RATE_LIMITED":
             quotes = json.loads(raw.decode())
             result = [f"{q['q'].strip()} — {q['a']}" for q in quotes if q.get("q") and q.get("a")]
@@ -224,6 +230,7 @@ def _fetch_quote_pool():
 
 
 def safe_fetch(url, timeout=15):
+    print("fetching: ", url)
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -938,20 +945,26 @@ def draw_screen(screen, state, fonts, tick):
                 draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
 
         # RAM price widget — bottom left
-        draw_ram_widget(screen, state, fonts, 60, 870)
+        if FEATURES["RAM_PRICE"]:
+            draw_ram_widget(screen, state, fonts, 60, 870)
+            draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}", fonts["tiny"], TEXT_DIM, W - 20,
+                      64, anchor="topright")
 
         # Tide widget — left column, below current temp
-        draw_tide_widget(screen, state, fonts, 80, 370, w=440, h=230)
+        if FEATURES["OSV_TIDES"]:
+            draw_tide_widget(screen, state, fonts, 80, 370, w=440, h=230)
+            draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}", fonts["tiny"], TEXT_DIM,
+                      W - 20, 86, anchor="topright")
 
         # OSV widget — left column, below tides
-        draw_osv_widget(screen, state, fonts, 80, 630, w=440)
+        if FEATURES["OSV_COUNT"]:
+            draw_osv_widget(screen, state, fonts, 80, 630, w=440)
+            draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}", fonts["tiny"], TEXT_DIM, W - 20,
+                      108, anchor="topright")
 
         # All "updated at" timestamps — top-right corner
         draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, 20, anchor="topright")
         draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 42, anchor="topright")
-        draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 64, anchor="topright")
-        draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}",    fonts["tiny"], TEXT_DIM, W-20, 86, anchor="topright")
-        draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 108, anchor="topright")
 
     # MOTD — shrink font until it fits within the screen width with padding
     max_w = W - 80
@@ -1013,9 +1026,9 @@ def main():
         state.update_osv()
 
     threading.Thread(target=_delayed_map_start,  daemon=True).start()
-    threading.Thread(target=_delayed_ram_start,  daemon=True).start()
-    threading.Thread(target=_delayed_tide_start, daemon=True).start()
-    threading.Thread(target=_delayed_osv_start,  daemon=True).start()
+    if FEATURES["RAM_PRICE"]: threading.Thread(target=_delayed_ram_start,  daemon=True).start()
+    if FEATURES["OSV_TIDES"]: threading.Thread(target=_delayed_tide_start, daemon=True).start()
+    if FEATURES["OSV_COUNT"]: threading.Thread(target=_delayed_osv_start,  daemon=True).start()
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -1031,13 +1044,13 @@ def main():
         if now - state.last_map_upd > 60 and not state._map_running:
             state.last_map_upd = now
             threading.Thread(target=state.update_map, daemon=True).start()
-        if now - state.last_ram_upd > 60 and not state._ram_running:
+        if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
             state.last_ram_upd = now
             threading.Thread(target=state.update_ram, daemon=True).start()
-        if now - state.last_tide_upd > 3600 and not state._tide_running:
+        if now - state.last_tide_upd > 3600 and not state._tide_running and FEATURES["OSV_TIDES"]:
             state.last_tide_upd = now
             threading.Thread(target=state.update_tides, daemon=True).start()
-        if now - state.last_osv_upd > 60 and not state._osv_running:
+        if now - state.last_osv_upd > 60 and not state._osv_running and FEATURES["OSV_COUNT"]:
             state.last_osv_upd = now
             threading.Thread(target=state.update_osv, daemon=True).start()
 

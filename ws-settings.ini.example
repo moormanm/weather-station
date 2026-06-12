@@ -16,3 +16,10 @@
 #LATITUDE=39.16189
 #LONGITUDE=-77.18515
 #NAME=Gaithersburg, MD
+
+
+[FEATURES]
+RAM_PRICE=false
+OSV_COUNT=false
+OSV_TIDES=false
+
