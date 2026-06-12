@@ -15,8 +15,9 @@ if command -v wlr-randr &>/dev/null; then
 fi
 
 # Launch weather station
-cd "/home/pi/weather_station"
+cd "/home/pi/weather-station"
+
 # get latest
-git pull
+git pull origin/main
 
 exec /usr/bin/python3 "/home/pi/weather-station/weather_station.py"
