@@ -36,9 +36,12 @@ LONGITUDE = config.getfloat("LOCATION", "LONGITUDE")
 LOCATION_NAME = config.get("LOCATION", "NAME")
 
 FEATURES = {
-    "OSV_COUNT": config.getboolean("FEATURES", "OSV_COUNT", fallback=False),
-    "OSV_TIDES": config.getboolean("FEATURES", "OSV_TIDES", fallback=False),
-    "RAM_PRICE": config.getboolean("FEATURES", "RAM_PRICE", fallback=False),
+    "OSV_COUNT":       config.getboolean("FEATURES", "OSV_COUNT",       fallback=False),
+    "OSV_TIDES":       config.getboolean("FEATURES", "OSV_TIDES",       fallback=False),
+    "RAM_PRICE":       config.getboolean("FEATURES", "RAM_PRICE",       fallback=False),
+    "HOURLY_FORECAST": config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
+    "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
+    "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=True),
 }
 
 TIMEZONE = "America/New_York"
@@ -367,6 +370,11 @@ class AppState:
         self.osv_reported_at = None  # datetime or None
         self.last_osv_upd = 0
         self._osv_running = False
+        # Potomac River state
+        self.potomac_level    = []   # list of (epoch_float, feet_float)
+        self.potomac_temp     = []   # list of (epoch_float, celsius_float)
+        self.last_potomac_upd = 0
+        self._potomac_running = False
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
@@ -387,6 +395,7 @@ class AppState:
             return
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
                f"&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
+               f"&hourly=temperature_2m,relativehumidity_2m"
                f"&current_weather=true&temperature_unit=fahrenheit&timezone={TIMEZONE}&forecast_days=7"
                f"&models=gfs_global")
         raw = safe_fetch(url)
@@ -616,6 +625,51 @@ class AppState:
                 self.last_osv_upd    = time.time()
         except Exception as e:
             print(f"OSV parse error: {e}")
+
+    # ── Potomac River ────────────────────────────────────────────────────────
+    def update_potomac(self):
+        if self._potomac_running:
+            return
+        self._potomac_running = True
+        try:
+            self._do_update_potomac()
+        finally:
+            self._potomac_running = False
+
+    def _do_update_potomac(self):
+        url = (
+            "https://waterservices.usgs.gov/nwis/iv/"
+            "?sites=01646500&parameterCd=00065&period=P7D&format=json"
+        )
+        raw = safe_fetch(url, timeout=20)
+        if not raw or raw == "RATE_LIMITED":
+            return
+        try:
+            data    = json.loads(raw.decode())
+            series  = data["value"]["timeSeries"]
+            level_pts: list = []
+            for ts in series:
+                code     = ts["variable"]["variableCode"][0]["value"]
+                no_data  = float(ts["values"][0].get("noDataValue", -999999))
+                vals     = ts["values"][0]["value"]
+                pts: list = []
+                for v in vals:
+                    raw_v = float(v["value"])
+                    if raw_v == no_data:
+                        continue
+                    dt_str = re.sub(r"\.\d+", "", v["dateTime"])
+                    try:
+                        epoch = datetime.strptime(dt_str, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+                    except Exception:
+                        continue
+                    pts.append((epoch, raw_v))
+                if code == "00065":
+                    level_pts = pts
+            with self.lock:
+                self.potomac_level    = level_pts
+                self.last_potomac_upd = time.time()
+        except Exception as e:
+            print(f"Potomac parse error: {e}")
 
 # ── UI Rendering ──────────────────────────────────────────────────────────────
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
@@ -884,6 +938,285 @@ def draw_ram_widget(screen, state, fonts, x, y):
     draw_text(screen, d7d_str, fonts["small"], d7d_col,  x + 190, y + 93)
 
 
+# ── Left-column layout engine ─────────────────────────────────────────────────
+# The zone below the current-temp / icon block is divided dynamically among
+# whichever features are enabled.  "Growable" widgets (chart types) expand
+# equally to absorb remaining space, capped at _COL_MAX_H each.
+
+_COL_X        = 60    # x for text-only widgets (SUNTIME title row, RAM labels)
+_COL_WIDGET_X = 80    # x for chart / bar widgets
+_COL_W        = 440   # width for chart / bar widgets  (right edge at x = 520)
+_COL_Y_TOP    = 350   # top of dynamic zone (just below current-temp / icon block)
+_COL_Y_BOT    = 1000  # bottom of dynamic zone (above MOTD bar)
+_COL_MAX_GAP  = 40    # maximum gap between adjacent widgets (actual gap is computed dynamically)
+_COL_MAX_H    = 400   # maximum height a growable widget may reach
+
+# Ordered catalog: (feature_key, min_h, growable)
+# Growable widgets grow equally to fill leftover space (up to _COL_MAX_H).
+# Non-growable widgets keep their fixed min_h.
+_COL_CATALOG = [
+    ("SUNTIME",          52,  False),
+    ("OSV_TIDES",       120,  True),
+    ("OSV_COUNT",        95,  False),
+    ("HOURLY_FORECAST", 120,  True),
+    ("POTOMAC",         120,  True),
+    ("RAM_PRICE",       128,  False),
+]
+
+
+def _left_column_layout():
+    """Return [(widget_key, y, h), ...] for all enabled left-column widgets.
+
+    Inter-widget gap is computed dynamically so all remaining space is shared
+    evenly, up to _COL_MAX_GAP.  After the gap is fixed, any leftover space
+    goes to the growable chart widgets (up to _COL_MAX_H each).
+    """
+    active = [(key, mn, grow) for key, mn, grow in _COL_CATALOG if FEATURES.get(key)]
+    if not active:
+        return []
+
+    n         = len(active)
+    available = _COL_Y_BOT - _COL_Y_TOP
+    sum_min   = sum(mn for _, mn, _ in active)
+
+    # Target gap: evenly share the space left at minimum heights, capped at _COL_MAX_GAP
+    target_gap = min(_COL_MAX_GAP, (available - sum_min) // (n - 1)) if n > 1 else 0
+    target_gap = max(target_gap, 0)
+
+    # Remainder after gaps goes to growable widgets
+    grow_budget = max(0, available - sum_min - target_gap * (n - 1))
+    heights     = [mn for _, mn, _ in active]
+    grow_idxs   = [i for i, (_, _, grow) in enumerate(active) if grow]
+
+    if grow_idxs and grow_budget > 0:
+        share     = grow_budget // len(grow_idxs)
+        remainder = grow_budget - share * len(grow_idxs)
+        for i in grow_idxs:
+            heights[i] = min(heights[i] + share, _COL_MAX_H)
+        fi = grow_idxs[0]
+        heights[fi] = min(heights[fi] + remainder, _COL_MAX_H)
+
+    # Recompute the actual gap from the final heights so any unclaimed space
+    # (e.g. charts hitting _COL_MAX_H) is still distributed evenly
+    total_h    = sum(heights)
+    actual_gap = min(_COL_MAX_GAP, (available - total_h) // (n - 1)) if n > 1 else 0
+    actual_gap = max(actual_gap, 0)
+
+    result, y = [], _COL_Y_TOP
+    for (key, _, _), h in zip(active, heights):
+        result.append((key, y, h))
+        y += h + actual_gap
+    return result
+
+
+def draw_suntime(screen, state, fonts, x, y):
+    """Sunrise / sunset two-line display.  x,y = top-left; occupies ~52 px tall."""
+    daily    = (state.weather or {}).get("daily", {})
+    sunrises = daily.get("sunrise", [])
+    sunsets  = daily.get("sunset",  [])
+    if not sunrises or not sunsets:
+        return
+    try:
+        rise = datetime.strptime(sunrises[0], "%Y-%m-%dT%H:%M").strftime("%-I:%M %p")
+        setr = datetime.strptime(sunsets[0],  "%Y-%m-%dT%H:%M").strftime("%-I:%M %p")
+    except Exception:
+        return
+    draw_text(screen, "Sun up",            fonts["tiny"],  TEXT_DIM, x,       y + 2)
+    draw_text(screen, f"\u2191 {rise}",    fonts["small"], GOLD,     x,       y + 20)
+    draw_text(screen, "Sun down",          fonts["tiny"],  TEXT_DIM, x + 220, y + 2)
+    draw_text(screen, f"\u2193 {setr}",    fonts["small"], TEXT_DIM, x + 220, y + 20)
+
+
+def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
+    """8-hour temperature + humidity dual-line chart.
+    x,y = top-left corner.  w x h = total bounding box (title bar included)."""
+    TITLE_H = 24   # header height above the panel rect
+    PAD_L   = 10   # inside panel — left margin
+    PAD_R   = 10   # inside panel — right margin
+    PAD_T   = 18   # inside panel — top margin (temperature value labels)
+    PAD_BOT = 22   # inside panel — bottom margin (hour labels)
+
+    draw_text(screen, "Next 8 Hours Temperature", fonts["tiny"], TEXT_DIM, x, y + 4)
+
+    panel_y = y + TITLE_H
+    panel_h = h - TITLE_H
+    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+
+    hourly = (state.weather or {}).get("hourly", {})
+    times  = hourly.get("time", [])
+    temps  = hourly.get("temperature_2m", [])
+    humids = hourly.get("relativehumidity_2m", [])
+
+    if not times or not temps or not humids:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    # Locate current-hour slot; fall back to the nearest past hour
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:00")
+    if now_str in times:
+        idx = times.index(now_str)
+    else:
+        idx = max((i for i, t in enumerate(times) if t <= now_str), default=0)
+
+    N       = 8
+    s_times = times[idx: idx + N]
+    s_temps = temps[idx: idx + N]
+    s_humid = humids[idx: idx + N]
+    n       = len(s_times)
+
+    if n < 2:
+        draw_text(screen, "No data", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    # Chart area inside the panel
+    chart_x = x + PAD_L
+    chart_y = panel_y + PAD_T
+    chart_w = w - PAD_L - PAD_R
+    chart_h = panel_h - PAD_T - PAD_BOT
+
+    # X-coordinate for slot i, spread evenly across chart_w
+    def _cx(i):
+        return chart_x + int(i / (N - 1) * chart_w)
+
+    # Temperature: auto-scale with ±4 ° padding so the line never hugs an edge
+    t_lo  = min(s_temps) - 4
+    t_hi  = max(s_temps) + 4
+    t_rng = max(t_hi - t_lo, 1.0)
+
+    def _ty(v):
+        return chart_y + chart_h - int((v - t_lo) / t_rng * chart_h)
+
+    # Humidity: fixed 0–100 % scale (kept for future use; not drawn)
+    def _hy(v):
+        return chart_y + chart_h - int(v / 100.0 * chart_h)
+
+    # Subtle vertical grid lines at each hour slot
+    for i in range(n):
+        pygame.draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
+
+    # ── Temperature line (ACCENT) ──────────────────────────────────────────────
+    t_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
+    if len(t_pts) >= 2:
+        pygame.draw.lines(screen, ACCENT, False, t_pts, 2)
+    for i, (px, py) in enumerate(t_pts):
+        pygame.draw.circle(screen, GOLD if i == 0 else ACCENT, (px, py), 5 if i == 0 else 3)
+
+    # Temperature value labels — above each dot, flipped below when near the top
+    for i, (px, py) in enumerate(t_pts):
+        lbl = f"{round(s_temps[i])}\u00b0"
+        if py - chart_y < 16:
+            draw_text(screen, lbl, fonts["tiny"], ACCENT, px, py + 6,  anchor="midtop")
+        else:
+            draw_text(screen, lbl, fonts["tiny"], ACCENT, px, py - 4, anchor="midbottom")
+
+    # ── Hour labels along the bottom ──────────────────────────────────────────
+    label_y = panel_y + panel_h - PAD_BOT + 3
+    for i, t_str in enumerate(s_times):
+        hr   = int(t_str[11:13])
+        ampm = "a" if hr < 12 else "p"
+        h12  = hr % 12 or 12
+        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), label_y, anchor="midtop")
+
+
+def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
+    """Potomac River gage height 7-day history chart (USGS Little Falls).
+    x,y = top-left corner.  w×h = total bounding box (two-line title included).
+    Y-axis labels (lo / mid / hi) with spine; no inline annotations.
+    """
+    from datetime import date as _date, timedelta as _td
+
+    TITLE_H = 44   # two lines at tiny (20 px) with 4 px top margin
+    PAD_L   = 48   # room for y-axis labels fully inside the panel
+    PAD_R   = 8
+    PAD_T   = 10
+    PAD_BOT = 22
+
+    # Two-line title
+    draw_text(screen, "Potomac at Little Falls", fonts["tiny"], TEXT_DIM, x, y + 4)
+    draw_text(screen, "gage height (ft) \u00b7 last 7 days", fonts["tiny"], TEXT_DIM, x, y + 22)
+
+    panel_y = y + TITLE_H
+    panel_h = h - TITLE_H
+    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+
+    lvl_pts = state.potomac_level   # [(epoch, feet), ...]
+
+    if not lvl_pts:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    chart_x = x + PAD_L
+    chart_y = panel_y + PAD_T
+    chart_w = w - PAD_L - PAD_R
+    chart_h = panel_h - PAD_T - PAD_BOT
+
+    # Time axis: 7 days ago → now
+    now_ep = time.time()
+    t_min  = now_ep - 7 * 86400
+    t_rng  = now_ep - t_min
+
+    def _cx(ep):
+        return chart_x + int((ep - t_min) / t_rng * chart_w)
+
+    # Day gridlines + labels
+    for d_off in range(-7, 1):
+        midnight_ep = datetime.combine(
+            _date.today() + _td(days=d_off),
+            datetime.min.time()
+        ).timestamp()
+        if t_min <= midnight_ep <= now_ep:
+            gx = _cx(midnight_ep)
+            pygame.draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
+            day_lbl = (_date.today() + _td(days=d_off)).strftime("%a")
+            draw_text(screen, day_lbl, fonts["tiny"], TEXT_DIM,
+                      gx + 3, chart_y + chart_h + 2, anchor="midtop")
+
+    vis_lv  = [(ep, v) for ep, v in lvl_pts if t_min <= ep <= now_ep]
+    lv_vals = [v for _, v in vis_lv]
+    if not lv_vals:
+        return
+
+    lv_lo  = min(lv_vals) - 0.2
+    lv_hi  = max(lv_vals) + 0.2
+    lv_rng = max(lv_hi - lv_lo, 0.1)
+
+    def _ly(v, _lo=lv_lo, _rng=lv_rng):
+        return chart_y + chart_h - int((v - _lo) / _rng * chart_h)
+
+    # ── Y-axis: lo / mid / hi of the data, deduplicated after rounding ────────
+    lo_v  = min(lv_vals)
+    hi_v  = max(lv_vals)
+    mid_v = (lo_v + hi_v) / 2
+    seen, ticks = set(), []
+    for tv in (lo_v, mid_v, hi_v):
+        rv = round(tv, 1)
+        if rv not in seen:
+            seen.add(rv)
+            ticks.append(rv)
+
+    # Spine
+    pygame.draw.line(screen, TEXT_DIM, (chart_x, chart_y), (chart_x, chart_y + chart_h), 1)
+    for tv in ticks:
+        ty = _ly(tv)
+        pygame.draw.line(screen, BG, (chart_x, ty), (chart_x + chart_w, ty), 1)
+        pygame.draw.line(screen, TEXT_DIM, (chart_x - 3, ty), (chart_x, ty), 1)  # tick mark
+        draw_text(screen, f"{tv:.1f}", fonts["tiny"], TEXT_DIM,
+                  chart_x - 6, ty, anchor="midright")
+
+    # ── Gage height line ──────────────────────────────────────────────────────
+    pts = [(_cx(ep), _ly(v)) for ep, v in vis_lv]
+    if len(pts) >= 2:
+        pygame.draw.lines(screen, RAIN, False, pts, 2)
+
+    # Current value — top-right
+    cur_lvl = lvl_pts[-1][1]
+    draw_text(screen, f"Now {cur_lvl:.1f} ft", fonts["tiny"], RAIN,
+              chart_x + chart_w - 2, chart_y + 2, anchor="topright")
+
+
 def draw_screen(screen, state, fonts, tick):
     screen.fill(BG)
     W, H = screen.get_size()
@@ -944,23 +1277,28 @@ def draw_screen(screen, state, fonts, tick):
             else:
                 draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
 
-        # RAM price widget — bottom left
-        if FEATURES["RAM_PRICE"]:
-            draw_ram_widget(screen, state, fonts, 60, 870)
-            draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}", fonts["tiny"], TEXT_DIM, W - 20,
-                      64, anchor="topright")
-
-        # Tide widget — left column, below current temp
-        if FEATURES["OSV_TIDES"]:
-            draw_tide_widget(screen, state, fonts, 80, 370, w=440, h=230)
-            draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}", fonts["tiny"], TEXT_DIM,
-                      W - 20, 86, anchor="topright")
-
-        # OSV widget — left column, below tides
-        if FEATURES["OSV_COUNT"]:
-            draw_osv_widget(screen, state, fonts, 80, 630, w=440)
-            draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}", fonts["tiny"], TEXT_DIM, W - 20,
-                      108, anchor="topright")
+        # Left-column dynamic layout — positions and heights computed by _left_column_layout()
+        for _wkey, _wy, _wh in _left_column_layout():
+            if _wkey == "SUNTIME":
+                draw_suntime(screen, state, fonts, _COL_X, _wy)
+            elif _wkey == "OSV_TIDES":
+                draw_tide_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
+                draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}",
+                          fonts["tiny"], TEXT_DIM, W - 20, 86, anchor="topright")
+            elif _wkey == "OSV_COUNT":
+                draw_osv_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W)
+                draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}",
+                          fonts["tiny"], TEXT_DIM, W - 20, 108, anchor="topright")
+            elif _wkey == "HOURLY_FORECAST":
+                draw_hourly_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
+            elif _wkey == "POTOMAC":
+                draw_potomac_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
+                draw_text(screen, f"Potomac updated at:    {_fmt_upd(state.last_potomac_upd)}",
+                          fonts["tiny"], TEXT_DIM, W - 20, 130, anchor="topright")
+            elif _wkey == "RAM_PRICE":
+                draw_ram_widget(screen, state, fonts, _COL_X, _wy)
+                draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",
+                          fonts["tiny"], TEXT_DIM, W - 20, 64, anchor="topright")
 
         # All "updated at" timestamps — top-right corner
         draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, 20, anchor="topright")
@@ -1025,10 +1363,15 @@ def main():
         time.sleep(6)
         state.update_osv()
 
-    threading.Thread(target=_delayed_map_start,  daemon=True).start()
-    if FEATURES["RAM_PRICE"]: threading.Thread(target=_delayed_ram_start,  daemon=True).start()
-    if FEATURES["OSV_TIDES"]: threading.Thread(target=_delayed_tide_start, daemon=True).start()
-    if FEATURES["OSV_COUNT"]: threading.Thread(target=_delayed_osv_start,  daemon=True).start()
+    def _delayed_potomac_start():
+        time.sleep(7)
+        state.update_potomac()
+
+    threading.Thread(target=_delayed_map_start,     daemon=True).start()
+    if FEATURES["RAM_PRICE"]: threading.Thread(target=_delayed_ram_start,     daemon=True).start()
+    if FEATURES["OSV_TIDES"]: threading.Thread(target=_delayed_tide_start,    daemon=True).start()
+    if FEATURES["OSV_COUNT"]: threading.Thread(target=_delayed_osv_start,     daemon=True).start()
+    if FEATURES["POTOMAC"]:   threading.Thread(target=_delayed_potomac_start, daemon=True).start()
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -1053,6 +1396,9 @@ def main():
         if now - state.last_osv_upd > 60 and not state._osv_running and FEATURES["OSV_COUNT"]:
             state.last_osv_upd = now
             threading.Thread(target=state.update_osv, daemon=True).start()
+        if now - state.last_potomac_upd > 3600 and not state._potomac_running and FEATURES["POTOMAC"]:
+            state.last_potomac_upd = now
+            threading.Thread(target=state.update_potomac, daemon=True).start()
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()

@@ -22,4 +22,7 @@
 RAM_PRICE=false
 OSV_COUNT=false
 OSV_TIDES=false
+HOURLY_FORECAST=false
+SUNTIME=false
+POTOMAC=false
 
