@@ -536,6 +536,8 @@ class AppState:
             import random
             pool = _fetch_quote_pool()
             if not pool:
+                with self.lock:
+                    self.motd_last_cycle = time.time()  # start retry clock even on failure
                 return
             random.shuffle(pool)
             start = random.randrange(len(pool))
@@ -1312,15 +1314,16 @@ def draw_screen(screen, state, fonts, tick):
             break
     screen.blit(motd_surf, motd_surf.get_rect(center=(W // 2, H - 40)))
 
-    # Cycle MOTD every 30 seconds; refetch a new batch when pool is exhausted
+    # Cycle MOTD every 30 seconds; retry fetch if pool is empty or exhausted
     now = time.time()
-    if state.motd_pool and now - state.motd_last_cycle > 30:
-        next_index = state.motd_index + 1
-        if next_index >= len(state.motd_pool):
-            # Pool exhausted — fetch a fresh batch in the background
-            threading.Thread(target=state.update_quotes, daemon=True).start()
+    if now - state.motd_last_cycle > 30:
+        if not state.motd_pool or state.motd_index + 1 >= len(state.motd_pool):
+            # Pool empty (fetch failed) or exhausted — request a fresh batch
+            if not state._quotes_running:
+                threading.Thread(target=state.update_quotes, daemon=True).start()
+            state.motd_last_cycle = now  # throttle: don't re-trigger next frame
         else:
-            state.motd_index = next_index
+            state.motd_index += 1
             state.motd = state.motd_pool[state.motd_index]
             state.motd_last_cycle = now
 
