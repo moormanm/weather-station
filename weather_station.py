@@ -1393,13 +1393,13 @@ def main():
         if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
             state.last_ram_upd = now
             threading.Thread(target=state.update_ram, daemon=True).start()
-        if now - state.last_tide_upd > 3600 and not state._tide_running and FEATURES["OSV_TIDES"]:
+        if now - state.last_tide_upd > 300 and not state._tide_running and FEATURES["OSV_TIDES"]:
             state.last_tide_upd = now
             threading.Thread(target=state.update_tides, daemon=True).start()
         if now - state.last_osv_upd > 60 and not state._osv_running and FEATURES["OSV_COUNT"]:
             state.last_osv_upd = now
             threading.Thread(target=state.update_osv, daemon=True).start()
-        if now - state.last_potomac_upd > 3600 and not state._potomac_running and FEATURES["POTOMAC"]:
+        if now - state.last_potomac_upd > 300 and not state._potomac_running and FEATURES["POTOMAC"]:
             state.last_potomac_upd = now
             threading.Thread(target=state.update_potomac, daemon=True).start()
 
