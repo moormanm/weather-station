@@ -76,6 +76,7 @@ RAM_HISTORY_FILE = os.path.join(TILE_CACHE_DIR, "ram_price_history.json")
 # ── Colors ────────────────────────────────────────────────────────────────────
 BG, PANEL = (10, 14, 26), (18, 24, 42)
 ACCENT, GOLD, RAIN = (64, 196, 255), (255, 200, 80), (60, 140, 255)
+TEMP_NEUTRAL = (200, 200, 210)
 TEXT_DIM, TEXT_BRIGHT = (110, 130, 170), (255, 255, 255)
 GREEN, RED = (60, 220, 100), (220, 70, 70)
 
@@ -1254,17 +1255,17 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
     # ── Temperature line (ACCENT) ──────────────────────────────────────────────
     t_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
     if len(t_pts) >= 2:
-        pygame.draw.lines(screen, ACCENT, False, t_pts, 2)
+        pygame.draw.lines(screen, TEMP_NEUTRAL, False, t_pts, 2)
     for i, (px, py) in enumerate(t_pts):
-        pygame.draw.circle(screen, GOLD if i == 0 else ACCENT, (px, py), 5 if i == 0 else 3)
+        pygame.draw.circle(screen, GOLD if i == 0 else TEMP_NEUTRAL, (px, py), 5 if i == 0 else 3)
 
     # Temperature value labels — above each dot, flipped below when near the top
     for i, (px, py) in enumerate(t_pts):
         lbl = f"{round(s_temps[i])}\u00b0"
         if py - chart_y < 16:
-            draw_text(screen, lbl, fonts["tiny"], ACCENT, px, py + 6,  anchor="midtop")
+            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py + 6,  anchor="midtop")
         else:
-            draw_text(screen, lbl, fonts["tiny"], ACCENT, px, py - 4, anchor="midbottom")
+            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py - 4, anchor="midbottom")
 
     # ── Hour labels along the bottom ──────────────────────────────────────────
     label_y = panel_y + panel_h - PAD_BOT + 3
@@ -1353,22 +1354,22 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
             ticks.append(rv)
 
     # Spine
-    pygame.draw.line(screen, TEXT_DIM, (chart_x, chart_y), (chart_x, chart_y + chart_h), 1)
+    pygame.draw.line(screen, TEMP_NEUTRAL, (chart_x, chart_y), (chart_x, chart_y + chart_h), 1)
     for tv in ticks:
         ty = _ly(tv)
         pygame.draw.line(screen, BG, (chart_x, ty), (chart_x + chart_w, ty), 1)
-        pygame.draw.line(screen, TEXT_DIM, (chart_x - 3, ty), (chart_x, ty), 1)  # tick mark
-        draw_text(screen, f"{tv:.1f}", fonts["tiny"], TEXT_DIM,
+        pygame.draw.line(screen, TEMP_NEUTRAL, (chart_x - 3, ty), (chart_x, ty), 1)  # tick mark
+        draw_text(screen, f"{tv:.1f}", fonts["tiny"], TEMP_NEUTRAL,
                   chart_x - 6, ty, anchor="midright")
 
     # ── Gage height line ──────────────────────────────────────────────────────
     pts = [(_cx(ep), _ly(v)) for ep, v in vis_lv]
     if len(pts) >= 2:
-        pygame.draw.lines(screen, RAIN, False, pts, 2)
+        pygame.draw.lines(screen, TEMP_NEUTRAL, False, pts, 2)
 
     # Current value — top-right
     cur_lvl = lvl_pts[-1][1]
-    draw_text(screen, f"Now {cur_lvl:.1f} ft", fonts["tiny"], RAIN,
+    draw_text(screen, f"Now {cur_lvl:.1f} ft", fonts["tiny"], TEMP_NEUTRAL,
               chart_x + chart_w - 2, chart_y + 2, anchor="topright")
 
 
