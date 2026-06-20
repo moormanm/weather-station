@@ -42,7 +42,10 @@ FEATURES = {
     "HOURLY_FORECAST": config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
     "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
     "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=True),
+    "NFLSTATS":        config.getboolean("FEATURES", "NFLSTATS",        fallback=False),
 }
+
+NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_section("NFLSTATS") else ""
 
 TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
@@ -232,10 +235,10 @@ def _fetch_quote_pool():
     return []
 
 
-def safe_fetch(url, timeout=15):
+def safe_fetch(url, timeout=15, headers=None):
     print("fetching: ", url)
     try:
-        req = urllib.request.Request(url, headers=HEADERS)
+        req = urllib.request.Request(url, headers=headers or HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.read()
     except urllib.error.HTTPError as e:
@@ -375,6 +378,11 @@ class AppState:
         self.potomac_temp     = []   # list of (epoch_float, celsius_float)
         self.last_potomac_upd = 0
         self._potomac_running = False
+        # NFL standings state
+        self.nfl_nfc_north    = []    # list of standings rows for NFC North
+        self.nfl_season       = None
+        self.last_nfl_upd     = 0
+        self._nfl_running     = False
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
@@ -673,6 +681,117 @@ class AppState:
         except Exception as e:
             print(f"Potomac parse error: {e}")
 
+    # ── NFL standings ────────────────────────────────────────────────────────
+    def update_nflstats(self):
+        if self._nfl_running:
+            return
+        self._nfl_running = True
+        try:
+            self._do_update_nflstats()
+        finally:
+            self._nfl_running = False
+
+    def _do_update_nflstats(self):
+        if not NFL_API_KEY:
+            return
+        now_dt = datetime.now()
+        season = now_dt.year if now_dt.month >= 9 else now_dt.year - 1
+        hdrs = {"Authorization": NFL_API_KEY, "User-Agent": USER_AGENT}
+        teams_url = "https://api.balldontlie.io/nfl/v1/teams?conference=NFC&division=NORTH"
+        all_games = []
+        try:
+            raw = safe_fetch(teams_url, timeout=20, headers=hdrs)
+            if not raw or raw == "RATE_LIMITED":
+                return
+            teams_data = json.loads(raw.decode()).get("data", [])
+            team_ids = [t.get("id") for t in teams_data if t.get("id")]
+            if not team_ids:
+                return
+
+            team_qs = "&".join(f"team_ids[]={tid}" for tid in team_ids)
+            url = f"https://api.balldontlie.io/nfl/v1/games?seasons[]={season}&postseason=false&per_page=100&{team_qs}"
+            cursor = None
+            while True:
+                page_url = url if cursor is None else f"{url}&cursor={cursor}"
+                raw = safe_fetch(page_url, timeout=20, headers=hdrs)
+                if not raw or raw == "RATE_LIMITED":
+                    break
+                data = json.loads(raw.decode())
+                all_games.extend(data.get("data", []))
+                cursor = (data.get("meta") or {}).get("next_cursor")
+                if not cursor:
+                    break
+
+            if not all_games:
+                return
+
+            teams = {}
+            for game in all_games:
+                if game.get("status") != "Final":
+                    continue
+                home = game.get("home_team") or {}
+                away = game.get("visitor_team") or {}
+                for t in (home, away):
+                    if t.get("conference") != "NFC" or t.get("division") != "NORTH":
+                        continue
+                    teams.setdefault(t.get("abbreviation"), {
+                        "team": t,
+                        "wins": 0,
+                        "losses": 0,
+                        "ties": 0,
+                        "pf": 0,
+                        "pa": 0,
+                    })
+
+                if home.get("conference") == "NFC" and home.get("division") == "NORTH" and away.get("conference") == "NFC" and away.get("division") == "NORTH":
+                    home_score = int(game.get("home_team_score") or 0)
+                    away_score = int(game.get("visitor_team_score") or 0)
+                    for t, pf, pa in ((home, home_score, away_score), (away, away_score, home_score)):
+                        row = teams[t.get("abbreviation")]
+                        row["pf"] += pf
+                        row["pa"] += pa
+                    if home_score > away_score:
+                        teams[home.get("abbreviation")]["wins"] += 1
+                        teams[away.get("abbreviation")]["losses"] += 1
+                    elif away_score > home_score:
+                        teams[away.get("abbreviation")]["wins"] += 1
+                        teams[home.get("abbreviation")]["losses"] += 1
+                    else:
+                        teams[home.get("abbreviation")]["ties"] += 1
+                        teams[away.get("abbreviation")]["ties"] += 1
+                else:
+                    # Only count games against NFC North opponents.
+                    for side, opp_side in ((home, away), (away, home)):
+                        if side.get("conference") != "NFC" or side.get("division") != "NORTH":
+                            continue
+                        score = int(game.get("home_team_score") if side is home else game.get("visitor_team_score") or 0)
+                        opp_score = int(game.get("visitor_team_score") if side is home else game.get("home_team_score") or 0)
+                        row = teams[side.get("abbreviation")]
+                        row["pf"] += score
+                        row["pa"] += opp_score
+                        if score > opp_score:
+                            row["wins"] += 1
+                        elif score < opp_score:
+                            row["losses"] += 1
+                        else:
+                            row["ties"] += 1
+
+            rows = []
+            for row in teams.values():
+                gp = row["wins"] + row["losses"] + row["ties"]
+                row["overall_record"] = f"{row['wins']}-{row['losses']}" + (f"-{row['ties']}" if row['ties'] else "")
+                row["point_differential"] = row["pf"] - row["pa"]
+                row["games_played"] = gp
+                rows.append(row)
+
+            rows.sort(key=lambda r: (-r["wins"], r["losses"], -r["point_differential"], r["team"]["full_name"]))
+            with self.lock:
+                self.nfl_nfc_north = rows
+                self.nfl_season = season
+                self.last_nfl_upd = time.time()
+        except Exception as e:
+            print(f"NFL standings parse error: {e}")
+
 # ── UI Rendering ──────────────────────────────────────────────────────────────
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
     img = font.render(str(text), True, color)
@@ -940,6 +1059,39 @@ def draw_ram_widget(screen, state, fonts, x, y):
     draw_text(screen, d7d_str, fonts["small"], d7d_col,  x + 190, y + 93)
 
 
+def draw_nflstats_widget(screen, state, fonts, x, y, w=440, h=200):
+    """Compact NFC North standings widget."""
+    TITLE_H = 24
+    min_panel_h = 14 + (24 * 4) + 8
+    panel_y = y + TITLE_H
+    panel_h = max(h - TITLE_H, min_panel_h)
+    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+
+    rows = state.nfl_nfc_north
+    if not rows:
+        draw_text(screen, "Loading NFC North...", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    title = f"NFC North standings" + (f"  {state.nfl_season}" if state.nfl_season else "")
+    draw_text(screen, title, fonts["tiny"], TEXT_DIM, x, y + 4)
+
+    row_y = panel_y + 14
+    row_step = 24
+    for row in rows:
+        team = row.get("team") or {}
+        full_name = team.get("full_name", "")
+        wl = row.get("overall_record", "0-0")
+        is_gb = full_name == "Green Bay Packers"
+        row_color = TEXT_BRIGHT if is_gb else TEXT_DIM
+        if is_gb:
+            pygame.draw.rect(screen, (30, 56, 34), (x + 6, row_y - 2, w - 12, 22), border_radius=6)
+        draw_text(screen, full_name, fonts["tiny"], row_color, x + 14, row_y)
+        draw_text(screen, wl, fonts["tiny"], row_color, x + w - 14, row_y, anchor="topright")
+        row_y += row_step
+
+
+
 # ── Left-column layout engine ─────────────────────────────────────────────────
 # The zone below the current-temp / icon block is divided dynamically among
 # whichever features are enabled.  "Growable" widgets (chart types) expand
@@ -962,6 +1114,7 @@ _COL_CATALOG = [
     ("OSV_COUNT",        95,  False),
     ("HOURLY_FORECAST", 120,  True),
     ("POTOMAC",         120,  True),
+    ("NFLSTATS",        168,  False),
     ("RAM_PRICE",       128,  False),
 ]
 
@@ -1227,11 +1380,6 @@ def draw_screen(screen, state, fonts, tick):
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
 
-        # Last-updated helper (used in multiple sections)
-        def _fmt_upd(ts):
-            if ts == 0:
-                return "never"
-            return datetime.fromtimestamp(ts).strftime("%-I:%M %p")
 
         if not state.weather:
             draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H//2, anchor="center")
@@ -1285,26 +1433,17 @@ def draw_screen(screen, state, fonts, tick):
                 draw_suntime(screen, state, fonts, _COL_X, _wy)
             elif _wkey == "OSV_TIDES":
                 draw_tide_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
-                draw_text(screen, f"Tides updated at:      {_fmt_upd(state.last_tide_upd)}",
-                          fonts["tiny"], TEXT_DIM, W - 20, 86, anchor="topright")
             elif _wkey == "OSV_COUNT":
                 draw_osv_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W)
-                draw_text(screen, f"OSV updated at:        {_fmt_upd(state.last_osv_upd)}",
-                          fonts["tiny"], TEXT_DIM, W - 20, 108, anchor="topright")
             elif _wkey == "HOURLY_FORECAST":
                 draw_hourly_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "POTOMAC":
                 draw_potomac_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
-                draw_text(screen, f"Potomac updated at:    {_fmt_upd(state.last_potomac_upd)}",
-                          fonts["tiny"], TEXT_DIM, W - 20, 130, anchor="topright")
+            elif _wkey == "NFLSTATS":
+                draw_nflstats_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "RAM_PRICE":
                 draw_ram_widget(screen, state, fonts, _COL_X, _wy)
-                draw_text(screen, f"RAM price updated at:  {_fmt_upd(state.last_ram_upd)}",
-                          fonts["tiny"], TEXT_DIM, W - 20, 64, anchor="topright")
 
-        # All "updated at" timestamps — top-right corner
-        draw_text(screen, f"Forecast updated at:   {_fmt_upd(state.last_weather_upd)}", fonts["tiny"], TEXT_DIM, W-20, 20, anchor="topright")
-        draw_text(screen, f"Radar updated at:      {_fmt_upd(state.last_map_upd)}",     fonts["tiny"], TEXT_DIM, W-20, 42, anchor="topright")
 
     # MOTD — shrink font until it fits within the screen width with padding
     max_w = W - 80
@@ -1370,11 +1509,16 @@ def main():
         time.sleep(7)
         state.update_potomac()
 
+    def _delayed_nfl_start():
+        time.sleep(9)
+        state.update_nflstats()
+
     threading.Thread(target=_delayed_map_start,     daemon=True).start()
     if FEATURES["RAM_PRICE"]: threading.Thread(target=_delayed_ram_start,     daemon=True).start()
     if FEATURES["OSV_TIDES"]: threading.Thread(target=_delayed_tide_start,    daemon=True).start()
     if FEATURES["OSV_COUNT"]: threading.Thread(target=_delayed_osv_start,     daemon=True).start()
     if FEATURES["POTOMAC"]:   threading.Thread(target=_delayed_potomac_start, daemon=True).start()
+    if FEATURES["NFLSTATS"] and NFL_API_KEY: threading.Thread(target=_delayed_nfl_start, daemon=True).start()
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -1402,6 +1546,9 @@ def main():
         if now - state.last_potomac_upd > 300 and not state._potomac_running and FEATURES["POTOMAC"]:
             state.last_potomac_upd = now
             threading.Thread(target=state.update_potomac, daemon=True).start()
+        if now - state.last_nfl_upd > 300 and not state._nfl_running and FEATURES["NFLSTATS"] and NFL_API_KEY:
+            state.last_nfl_upd = now
+            threading.Thread(target=state.update_nflstats, daemon=True).start()
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()

@@ -55,6 +55,7 @@ All features are off by default. Enable in `~/ws-settings.ini` under `[FEATURES]
 | `OSV_COUNT` | Assateague OSV count bar | No | Scrapes osvcount.com |
 | `HOURLY_FORECAST` | 8-hour temp + humidity chart | **Yes** | Uses `hourly` data from Open-Meteo |
 | `POTOMAC` | Potomac River 7-day gage height chart | **Yes** | USGS station 01646500 (Little Falls, MD); `period=P7D`; polls every 3600 s |
+| `NFLSTATS` | NFC North standings | No | balldontlie NFL standings; requires `~/ws-settings.ini` `[NFLSTATS] API-KEY=` |
 | `RAM_PRICE` | DDR5 spot price ticker | No | Scrapes dramexchange.com |
 
 `HOURLY_FORECAST` requires `hourly=temperature_2m,relativehumidity_2m` in the Open-Meteo URL — this is already present in the code.
