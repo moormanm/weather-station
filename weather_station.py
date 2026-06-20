@@ -728,7 +728,7 @@ class AppState:
 
             teams = {}
             for game in all_games:
-                if game.get("status") != "Final":
+                if not str(game.get("status", "")).startswith("Final"):
                     continue
                 home = game.get("home_team") or {}
                 away = game.get("visitor_team") or {}
@@ -780,7 +780,7 @@ class AppState:
             rows = []
             for row in teams.values():
                 gp = row["wins"] + row["losses"] + row["ties"]
-                row["overall_record"] = f"{row['wins']}-{row['losses']}" + (f"-{row['ties']}" if row['ties'] else "")
+                row["overall_record"] = f"{row['wins']}-{row['losses']}-{row['ties']}"
                 row["point_differential"] = row["pf"] - row["pa"]
                 row["games_played"] = gp
                 rows.append(row)
