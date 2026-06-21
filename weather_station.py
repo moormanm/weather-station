@@ -828,7 +828,23 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
     # Location dot on the tile surface
     dot_x = 256 + 128 + LOC_DOT_OFFSET[0]  # center of center tile + sub-tile offset
     dot_y = 256 + 128 + LOC_DOT_OFFSET[1]
-    pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 8, 2)
+    pygame.draw.circle(tile_surf, (0, 0, 0), (dot_x, dot_y), 8)
+    pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
+    pygame.draw.circle(tile_surf, (255, 255, 255), (dot_x, dot_y), 2)
+
+    # Label the configured location name next to the marker.
+    label_font = fonts["tiny"]
+    label_img = label_font.render(LOCATION_NAME, True, TEXT_BRIGHT)
+    label_pad_x, label_pad_y = 8, 4
+    label_w, label_h = label_img.get_size()
+    label_x = dot_x + 12 if dot_x < 384 else dot_x - 12 - (label_w + label_pad_x * 2)
+    label_y = dot_y - (label_h // 2) - label_pad_y
+    label_x = max(6, min(label_x, 768 - label_w - label_pad_x * 2 - 6))
+    label_y = max(6, min(label_y, 768 - label_h - label_pad_y * 2 - 6))
+    label_box = pygame.Rect(label_x, label_y, label_w + label_pad_x * 2, label_h + label_pad_y * 2)
+    pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
+    pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
+    tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
 
     # Build a rounded-rect mask and apply it
     mask_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
