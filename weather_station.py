@@ -347,8 +347,9 @@ def _resolve_nws_endpoints():
 
 
 def _fetch_nws_hilo(forecast_url, stations_url):
-    """Return dict of {date_str: (hi_f, lo_f)} from NWS forecast + today's observed high."""
+    """Return (hilo_dict, current_obs_temp_f) from NWS forecast + observations."""
     hilo = {}
+    current_obs_temp_f = None
     try:
         # NWS 7-day forecast for days 1+
         raw = safe_fetch(forecast_url, timeout=15, retries=2)
@@ -380,10 +381,16 @@ def _fetch_nws_hilo(forecast_url, stations_url):
             today = datetime.now().strftime("%Y-%m-%d")
             today_temps = []
             for o in obs:
-                ts = o["properties"]["timestamp"]
-                t_c = o["properties"]["temperature"]["value"]
-                if ts[:10] == today and t_c is not None:
-                    today_temps.append(t_c * 9/5 + 32)
+                props = o.get("properties", {})
+                ts = props.get("timestamp")
+                t_obj = props.get("temperature") or {}
+                t_c = t_obj.get("value")
+                if ts and t_c is not None:
+                    t_f = t_c * 9/5 + 32
+                    if current_obs_temp_f is None:
+                        current_obs_temp_f = t_f
+                    if ts[:10] == today:
+                        today_temps.append(t_f)
             if today_temps:
                 obs_hi = round(max(today_temps))
                 existing = hilo.get(today, (None, None))
@@ -394,7 +401,7 @@ def _fetch_nws_hilo(forecast_url, stations_url):
     except Exception as e:
         print(f"NWS observation fetch error: {e}")
 
-    return hilo
+    return hilo, current_obs_temp_f
 
 
 def _load_ram_history():
@@ -439,8 +446,11 @@ def _fetch_ddr5_price():
 
 class AppState:
     def __init__(self):
+        self.started_at = time.time()
+        self.weather_loaded_once = False
         self.weather = None
         self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
+        self.obs_temp_f = None          # nearest NWS station current temp in Fahrenheit
         self.map_tiles = {}
         self.radar_tiles = {}
         self.last_weather_upd = 0
@@ -536,10 +546,12 @@ class AppState:
         if raw:
             try:
                 data = json.loads(raw.decode())
-                nws_hilo = _fetch_nws_hilo(forecast_url, stations_url)
+                nws_hilo, obs_temp_f = _fetch_nws_hilo(forecast_url, stations_url)
                 with self.lock:
                     self.weather = data
                     self.nws_hilo = nws_hilo
+                    self.obs_temp_f = obs_temp_f
+                    self.weather_loaded_once = True
                     self.last_weather_upd = time.time()
                 self.clear_runtime_error("WEATHER")
             except Exception as e:
@@ -1548,12 +1560,15 @@ def draw_screen(screen, state, fonts, tick):
     from datetime import timedelta as _td
 
     with state.lock:
+        started_at = state.started_at
+        weather_loaded_once = state.weather_loaded_once
         runtime_error_source = state.runtime_error_source
         runtime_error_message = state.runtime_error_message
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
 
         cur = (state.weather or {}).get("current")
+        obs_temp_f = state.obs_temp_f
         daily = (state.weather or {}).get("daily")
         has_current = bool(cur and "temperature_2m" in cur and "weather_code" in cur)
         has_daily = bool(
@@ -1567,14 +1582,20 @@ def draw_screen(screen, state, fonts, tick):
 
         # Current temp + icon
         if has_current:
-            temp_str = f"{round(cur['temperature_2m'])}°"
+            shown_temp_f = obs_temp_f if obs_temp_f is not None else cur["temperature_2m"]
+            temp_str = f"{round(shown_temp_f)}°"
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
             screen.blit(temp_surf, (60, 140))
             icon_x = 60 + temp_surf.get_width() + 18 + 65
             draw_weather_icon(screen, cur["weather_code"], icon_x, 195, 130, GOLD)
         else:
-            draw_text(screen, "Forecast unavailable", fonts["small"], GOLD, 60, 172)
-            draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
+            bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
+            if bootstrap_loading:
+                draw_text(screen, "Loading forecast...", fonts["small"], GOLD, 60, 172)
+                draw_text(screen, "Waiting for first weather update", fonts["tiny"], TEXT_DIM, 60, 210)
+            else:
+                draw_text(screen, "Forecast unavailable", fonts["small"], GOLD, 60, 172)
+                draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
 
 
         # Map box
@@ -1633,7 +1654,11 @@ def draw_screen(screen, state, fonts, tick):
             elif _wkey == "RAM_PRICE":
                 draw_ram_widget(screen, state, fonts, _COL_X, _wy)
 
-        draw_error_banner(screen, fonts, W, H, runtime_error_source, runtime_error_message)
+        show_banner = True
+        if runtime_error_source == "WEATHER" and (not weather_loaded_once) and (time.time() - started_at < 90):
+            show_banner = False
+        if show_banner:
+            draw_error_banner(screen, fonts, W, H, runtime_error_source, runtime_error_message)
 
 
     # MOTD — shrink font until it fits within the screen width with padding
