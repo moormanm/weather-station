@@ -41,6 +41,11 @@ FEATURES = {
     "OSV_TIDES":       config.getboolean("FEATURES", "OSV_TIDES",       fallback=False),
     "RAM_PRICE":       config.getboolean("FEATURES", "RAM_PRICE",       fallback=False),
     "HOURLY_FORECAST": config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
+    "HOURLY_PRECIP":   config.getboolean(
+        "FEATURES",
+        "HOURLY_PRECIP",
+        fallback=config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
+    ),
     "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
     "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=True),
     "NFLSTATS":        config.getboolean("FEATURES", "NFLSTATS",        fallback=False),
@@ -533,7 +538,7 @@ class AppState:
             return
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
                f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
-               f"&hourly=temperature_2m,relative_humidity_2m"
+               f"&hourly=temperature_2m,relative_humidity_2m,precipitation_probability"
                f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
                f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7"
                f"&models=gfs_global")
@@ -1294,7 +1299,8 @@ _COL_CATALOG = [
     ("SUNTIME",          52,  False),
     ("OSV_TIDES",       120,  True),
     ("OSV_COUNT",        95,  False),
-    ("HOURLY_FORECAST", 120,  True),
+    ("HOURLY_FORECAST", 150,  True),
+    ("HOURLY_PRECIP",   150,  True),
     ("POTOMAC",         120,  True),
     ("NFLSTATS",        168,  False),
     ("RAM_PRICE",       128,  False),
@@ -1364,97 +1370,175 @@ def draw_suntime(screen, state, fonts, x, y):
     draw_text(screen, f"\u2193 {setr}",    fonts["small"], TEXT_DIM, x + 220, y + 20)
 
 
-def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
-    """8-hour temperature + humidity dual-line chart.
-    x,y = top-left corner.  w x h = total bounding box (title bar included)."""
-    TITLE_H = 24   # header height above the panel rect
-    PAD_L   = 10   # inside panel — left margin
-    PAD_R   = 10   # inside panel — right margin
-    PAD_T   = 18   # inside panel — top margin (temperature value labels)
-    PAD_BOT = 22   # inside panel — bottom margin (hour labels)
+def _hourly_series(hourly, key, n=8):
+    times = hourly.get("time", [])
+    vals = hourly.get(key, [])
+    if not times or not vals:
+        return [], []
 
-    draw_text(screen, "Next 8 Hours Temperature", fonts["tiny"], TEXT_DIM, x, y + 4)
-
-    panel_y = y + TITLE_H
-    panel_h = h - TITLE_H
-    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
-
-    hourly = (state.weather or {}).get("hourly", {})
-    times  = hourly.get("time", [])
-    temps  = hourly.get("temperature_2m", [])
-    humids = hourly.get("relative_humidity_2m", [])
-
-    if not times or not temps or not humids:
-        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
-                  x + w // 2, panel_y + panel_h // 2, anchor="center")
-        return
-
-    # Locate current-hour slot; fall back to the nearest past hour
     now_str = datetime.now().strftime("%Y-%m-%dT%H:00")
     if now_str in times:
         idx = times.index(now_str)
     else:
         idx = max((i for i, t in enumerate(times) if t <= now_str), default=0)
 
-    N       = 8
-    s_times = times[idx: idx + N]
-    s_temps = temps[idx: idx + N]
-    s_humid = humids[idx: idx + N]
-    n       = len(s_times)
+    s_times = times[idx: idx + n]
+    s_vals = vals[idx: idx + n]
+    m = min(len(s_times), len(s_vals))
+    return s_times[:m], s_vals[:m]
 
-    if n < 2:
+
+def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
+    """8-hour temperature chart only. x,y = top-left corner; w x h includes title."""
+    TITLE_H = 24
+    PAD_L = 10
+    PAD_R = 12
+    PAD_TOP = 8
+    PAD_BOT = 22
+
+    panel_y = y + TITLE_H
+    panel_h = h - TITLE_H
+    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+    draw_text(screen, "Next 8 Hours Temp", fonts["tiny"], TEXT_DIM, x, y + 4)
+
+    hourly = (state.weather or {}).get("hourly", {})
+    s_times, s_temps = _hourly_series(hourly, "temperature_2m")
+
+    if len(s_times) < 2:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    try:
+        s_temps = [float(v) for v in s_temps]
+    except Exception:
         draw_text(screen, "No data", fonts["small"], TEXT_DIM,
                   x + w // 2, panel_y + panel_h // 2, anchor="center")
         return
 
-    # Chart area inside the panel
+    n = len(s_times)
     chart_x = x + PAD_L
-    chart_y = panel_y + PAD_T
+    chart_y = panel_y + PAD_TOP
     chart_w = w - PAD_L - PAD_R
-    chart_h = panel_h - PAD_T - PAD_BOT
+    chart_h = panel_h - PAD_TOP - PAD_BOT
 
-    # X-coordinate for slot i, spread evenly across chart_w
+    if chart_h < 40:
+        draw_text(screen, "Panel too small", fonts["tiny"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
     def _cx(i):
-        return chart_x + int(i / (N - 1) * chart_w)
+        return chart_x + int(i / max(1, n - 1) * chart_w)
 
-    # Temperature: auto-scale with ±4 ° padding so the line never hugs an edge
-    t_lo  = min(s_temps) - 4
-    t_hi  = max(s_temps) + 4
+    t_lo = min(s_temps)
+    t_hi = max(s_temps)
+    pad = max(2.0, (t_hi - t_lo) * 0.20)
+    t_lo -= pad
+    t_hi += pad
     t_rng = max(t_hi - t_lo, 1.0)
 
     def _ty(v):
         return chart_y + chart_h - int((v - t_lo) / t_rng * chart_h)
 
-    # Humidity: fixed 0–100 % scale (kept for future use; not drawn)
-    def _hy(v):
-        return chart_y + chart_h - int(v / 100.0 * chart_h)
-
-    # Subtle vertical grid lines at each hour slot
     for i in range(n):
         pygame.draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
+    for frac in (0.0, 0.5, 1.0):
+        gy = chart_y + int(chart_h * frac)
+        pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
-    # ── Temperature line (ACCENT) ──────────────────────────────────────────────
     t_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
     if len(t_pts) >= 2:
         pygame.draw.lines(screen, TEMP_NEUTRAL, False, t_pts, 2)
+
     for i, (px, py) in enumerate(t_pts):
         pygame.draw.circle(screen, GOLD if i == 0 else TEMP_NEUTRAL, (px, py), 5 if i == 0 else 3)
-
-    # Temperature value labels — above each dot, flipped below when near the top
-    for i, (px, py) in enumerate(t_pts):
         lbl = f"{round(s_temps[i])}\u00b0"
-        if py - chart_y < 16:
-            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py + 6,  anchor="midtop")
+        if py - chart_y < 14:
+            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py + 6, anchor="midtop")
         else:
             draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py - 4, anchor="midbottom")
 
-    # ── Hour labels along the bottom ──────────────────────────────────────────
-    label_y = panel_y + panel_h - PAD_BOT + 3
+    hour_y = chart_y + chart_h + 1
     for i, t_str in enumerate(s_times):
-        hr   = int(t_str[11:13])
+        hr = int(t_str[11:13])
         ampm = "a" if hr < 12 else "p"
-        h12  = hr % 12 or 12
-        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), label_y, anchor="midtop")
+        h12 = hr % 12 or 12
+        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), hour_y, anchor="midtop")
+
+
+def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
+    """8-hour precipitation chance chart. Separate widget with its own minimum height."""
+    TITLE_H = 24
+    PAD_L = 10
+    PAD_R = 12
+    PAD_TOP = 10
+    PAD_BOT = 24
+
+    panel_y = y + TITLE_H
+    panel_h = h - TITLE_H
+    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+    draw_text(screen, "Next 8 Hours Precip Chance", fonts["tiny"], TEXT_DIM, x, y + 4)
+
+    hourly = (state.weather or {}).get("hourly", {})
+    s_times, s_pops = _hourly_series(hourly, "precipitation_probability")
+
+    if len(s_times) < 2:
+        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    try:
+        s_pops = [max(0.0, min(100.0, float(v or 0))) for v in s_pops]
+    except Exception:
+        draw_text(screen, "No data", fonts["small"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    n = len(s_times)
+    chart_x = x + PAD_L
+    chart_y = panel_y + PAD_TOP
+    chart_w = w - PAD_L - PAD_R
+    chart_h = panel_h - PAD_TOP - PAD_BOT
+
+    if chart_h < 60:
+        draw_text(screen, "Panel too small", fonts["tiny"], TEXT_DIM,
+                  x + w // 2, panel_y + panel_h // 2, anchor="center")
+        return
+
+    def _cx(i):
+        return chart_x + int(i / max(1, n - 1) * chart_w)
+
+    def _py(p):
+        return chart_y + chart_h - int((p / 100.0) * chart_h)
+
+    for pct in (0, 25, 50, 75, 100):
+        gy = _py(pct)
+        pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
+
+    for i in range(n):
+        pygame.draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
+
+    bar_w = max(10, min(26, int(chart_w / max(1, n * 1.8))))
+    p_pts = []
+    for i, pct in enumerate(s_pops):
+        cx = _cx(i)
+        py = _py(pct)
+        p_pts.append((cx, py))
+        rect_h = max(1, chart_y + chart_h - py)
+        pygame.draw.rect(screen, (56, 102, 160), (cx - bar_w // 2, py, bar_w, rect_h), border_radius=3)
+        pygame.draw.circle(screen, RAIN if i == 0 else (126, 170, 228), (cx, py), 4 if i == 0 else 3)
+        lbl_y = max(chart_y + 10, py - 3)
+        draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], (170, 210, 255), cx, lbl_y, anchor="midbottom")
+
+    if len(p_pts) >= 2:
+        pygame.draw.lines(screen, RAIN, False, p_pts, 2)
+
+    hour_y = chart_y + chart_h + 2
+    for i, t_str in enumerate(s_times):
+        hr = int(t_str[11:13])
+        ampm = "a" if hr < 12 else "p"
+        h12 = hr % 12 or 12
+        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), hour_y, anchor="midtop")
 
 
 def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
@@ -1647,6 +1731,8 @@ def draw_screen(screen, state, fonts, tick):
                 draw_osv_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W)
             elif _wkey == "HOURLY_FORECAST":
                 draw_hourly_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
+            elif _wkey == "HOURLY_PRECIP":
+                draw_hourly_precip_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "POTOMAC":
                 draw_potomac_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "NFLSTATS":
