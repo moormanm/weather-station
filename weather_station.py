@@ -13,6 +13,7 @@ import math
 import hashlib
 import urllib.request
 import urllib.error
+import socket
 import random
 import re
 import io
@@ -47,7 +48,6 @@ FEATURES = {
 
 NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_section("NFLSTATS") else ""
 
-TIMEZONE = "America/New_York"
 SCREEN_W, SCREEN_H = 1920, 1080
 
 MAP_ZOOM = 7  # zoom level for both basemap and radar tiles (RainViewer max = 7)
@@ -67,8 +67,14 @@ LOC_DOT_OFFSET = _loc_pixel_offset(LATITUDE, LONGITUDE, MAP_ZOOM)
 USER_AGENT = "FrederickWeatherStation/1.8 (RPi3B+; Dashboard)"
 HEADERS = {"User-Agent": USER_AGENT}
 
-NWS_FORECAST_URL = "https://api.weather.gov/gridpoints/LWX/80,95/forecast"
-NWS_STATIONS_URL = "https://api.weather.gov/stations/KFDK/observations?limit=24"
+_NWS_ENDPOINTS_TTL = 3600
+_NWS_ENDPOINTS_LOCK = threading.Lock()
+_NWS_ENDPOINTS_CACHE = {
+    "forecast": None,
+    "observations": None,
+    "timezone": None,
+    "expires_at": 0,
+}
 TILE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "weather_station_tiles")
 os.makedirs(TILE_CACHE_DIR, exist_ok=True)
 RAM_HISTORY_FILE = os.path.join(TILE_CACHE_DIR, "ram_price_history.json")
@@ -236,28 +242,116 @@ def _fetch_quote_pool():
     return []
 
 
-def safe_fetch(url, timeout=15, headers=None):
+def _is_timeout_like_error(err):
+    reason = getattr(err, "reason", err)
+    if isinstance(reason, socket.timeout):
+        return True
+    msg = str(reason).lower()
+    return "timed out" in msg or "timeout" in msg
+
+
+def safe_fetch(url, timeout=15, headers=None, retries=0, retry_delay=1.5):
     print("fetching: ", url)
-    try:
-        req = urllib.request.Request(url, headers=headers or HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return r.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            print("!!! Rate limited (429). Cooling down.")
-            return "RATE_LIMITED"
-        return None
-    except Exception as e:
-        print(f"Fetch error: {e}")
-        return None
+    attempts = max(1, int(retries) + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=headers or HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print("!!! Rate limited (429). Cooling down.")
+                return "RATE_LIMITED"
+            print(f"Fetch error for {url}: {e}")
+            return None
+        except urllib.error.URLError as e:
+            if attempt < attempts and _is_timeout_like_error(e):
+                delay = retry_delay * attempt
+                print(f"Fetch timeout for {url} (attempt {attempt}/{attempts}), retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            print(f"Fetch error for {url}: {e}")
+            return None
+        except Exception as e:
+            if attempt < attempts and _is_timeout_like_error(e):
+                delay = retry_delay * attempt
+                print(f"Fetch timeout for {url} (attempt {attempt}/{attempts}), retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            print(f"Fetch error for {url}: {e}")
+            return None
+    return None
 
 
-def _fetch_nws_hilo():
+def _resolve_nws_endpoints():
+    """Resolve NWS forecast + observations URLs + timezone for configured LAT/LON."""
+    now = time.time()
+    with _NWS_ENDPOINTS_LOCK:
+        if (
+            _NWS_ENDPOINTS_CACHE["expires_at"] > now
+            and _NWS_ENDPOINTS_CACHE["forecast"]
+            and _NWS_ENDPOINTS_CACHE["observations"]
+            and _NWS_ENDPOINTS_CACHE["timezone"]
+        ):
+            return (
+                _NWS_ENDPOINTS_CACHE["forecast"],
+                _NWS_ENDPOINTS_CACHE["observations"],
+                _NWS_ENDPOINTS_CACHE["timezone"],
+            )
+
+    points_url = f"https://api.weather.gov/points/{LATITUDE:.4f},{LONGITUDE:.4f}"
+    raw = safe_fetch(points_url, timeout=15, retries=2)
+    if not raw or raw == "RATE_LIMITED":
+        raise RuntimeError("Failed to resolve NWS points data for configured coordinates")
+
+    props = json.loads(raw.decode()).get("properties", {})
+    forecast_url = props.get("forecast")
+    timezone = props.get("timeZone")
+    stations_url = props.get("observationStations")
+    if not forecast_url or not timezone or not stations_url:
+        raise RuntimeError("NWS points response missing forecast, timeZone, or observationStations")
+
+    stations_raw = safe_fetch(stations_url, timeout=15, retries=2)
+    if not stations_raw or stations_raw == "RATE_LIMITED":
+        raise RuntimeError("Failed to resolve NWS observation station list")
+
+    stations_data = json.loads(stations_raw.decode())
+    features = stations_data.get("features") or []
+    if not features:
+        raise RuntimeError("NWS observation station list is empty")
+
+    observations_url = None
+    for feature in features:
+        station_props = feature.get("properties", {})
+        station_id = station_props.get("stationIdentifier")
+        station_url = station_props.get("@id")
+        if station_id:
+            observations_url = f"https://api.weather.gov/stations/{station_id}/observations?limit=24"
+            break
+        if station_url:
+            observations_url = f"{station_url}/observations?limit=24"
+            break
+    if not observations_url:
+        raise RuntimeError("No usable NWS observation station endpoint found")
+
+    with _NWS_ENDPOINTS_LOCK:
+        _NWS_ENDPOINTS_CACHE["forecast"] = forecast_url
+        _NWS_ENDPOINTS_CACHE["observations"] = observations_url
+        _NWS_ENDPOINTS_CACHE["timezone"] = timezone
+        _NWS_ENDPOINTS_CACHE["expires_at"] = time.time() + _NWS_ENDPOINTS_TTL
+        return (
+            _NWS_ENDPOINTS_CACHE["forecast"],
+            _NWS_ENDPOINTS_CACHE["observations"],
+            _NWS_ENDPOINTS_CACHE["timezone"],
+        )
+
+
+def _fetch_nws_hilo(forecast_url, stations_url):
     """Return dict of {date_str: (hi_f, lo_f)} from NWS forecast + today's observed high."""
     hilo = {}
     try:
         # NWS 7-day forecast for days 1+
-        raw = safe_fetch(NWS_FORECAST_URL)
+        raw = safe_fetch(forecast_url, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
             periods = json.loads(raw.decode())["properties"]["periods"]
             hi_by_date = {}
@@ -279,8 +373,8 @@ def _fetch_nws_hilo():
         print(f"NWS forecast fetch error: {e}")
 
     try:
-        # Today's observed high from KFDK (Frederick Municipal Airport)
-        raw = safe_fetch(NWS_STATIONS_URL)
+        # Today's observed high from nearest NWS observation station
+        raw = safe_fetch(stations_url, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
             obs = json.loads(raw.decode())["features"]
             today = datetime.now().strftime("%Y-%m-%d")
@@ -388,6 +482,25 @@ class AppState:
         self._weather_running = False
         self._map_running = False
         self._ram_running = False
+        self.runtime_error_source = None
+        self.runtime_error_message = None
+        self.runtime_error_at = 0
+
+    def set_runtime_error(self, source, message):
+        msg = str(message).strip() or "Unknown error"
+        if len(msg) > 240:
+            msg = msg[:237] + "..."
+        with self.lock:
+            self.runtime_error_source = source
+            self.runtime_error_message = msg
+            self.runtime_error_at = time.time()
+
+    def clear_runtime_error(self, source=None):
+        with self.lock:
+            if source is None or self.runtime_error_source == source:
+                self.runtime_error_source = None
+                self.runtime_error_message = None
+                self.runtime_error_at = 0
 
     # ── Weather ───────────────────────────────────────────────────────────────
     def update_weather(self):
@@ -402,28 +515,40 @@ class AppState:
     def _do_update_weather(self):
         if time.time() < self.backoff_until:
             return
+        try:
+            forecast_url, stations_url, timezone = _resolve_nws_endpoints()
+        except Exception as e:
+            self.set_runtime_error("WEATHER", f"NWS endpoint resolve failed: {e}")
+            self.last_weather_upd = 0
+            return
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
-               f"&daily=weathercode,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
-               f"&hourly=temperature_2m,relativehumidity_2m"
-               f"&current_weather=true&temperature_unit=fahrenheit&timezone={TIMEZONE}&forecast_days=7"
+               f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
+               f"&hourly=temperature_2m,relative_humidity_2m"
+               f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
+               f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7"
                f"&models=gfs_global")
-        raw = safe_fetch(url)
+        raw = safe_fetch(url, timeout=20, retries=3, retry_delay=2.0)
         if raw == "RATE_LIMITED":
             self.backoff_until = time.time() + 1800
+            self.set_runtime_error("WEATHER", "Open-Meteo rate limited; retrying in 30 minutes")
+            self.last_weather_upd = time.time()
             return
         if raw:
             try:
                 data = json.loads(raw.decode())
-                nws_hilo = _fetch_nws_hilo()
+                nws_hilo = _fetch_nws_hilo(forecast_url, stations_url)
                 with self.lock:
                     self.weather = data
                     self.nws_hilo = nws_hilo
                     self.last_weather_upd = time.time()
+                self.clear_runtime_error("WEATHER")
             except Exception as e:
                 print(f"Weather parse error: {e}")
-                self.last_weather_upd = 0
+                self.set_runtime_error("WEATHER", f"Weather parse failed: {e}")
+                self.last_weather_upd = time.time()
         else:
-            self.last_weather_upd = 0
+            self.set_runtime_error("WEATHER", "Open-Meteo weather fetch failed")
+            self.last_weather_upd = time.time()
 
     # ── Map + Radar ───────────────────────────────────────────────────────────
     def update_map(self):
@@ -799,6 +924,34 @@ def draw_text(surf, text, font, color, x, y, anchor="topleft"):
     surf.blit(img, img.get_rect(**{anchor: (x, y)}))
 
 
+def draw_error_banner(screen, fonts, W, H, source, message):
+    if not message:
+        return
+    label = f"{source}: {message}" if source else str(message)
+    label = label.replace("\n", " ")
+    if len(label) > 130:
+        label = label[:127] + "..."
+
+    box_h = 32
+    box_w = min(W - 120, 980)
+    box_x = (W - box_w) // 2
+    box_y = H - 84
+    rect = pygame.Rect(box_x, box_y, box_w, box_h)
+    pygame.draw.rect(screen, (88, 20, 20), rect, border_radius=8)
+    pygame.draw.rect(screen, RED, rect, 1, border_radius=8)
+    draw_text(screen, label, fonts["tiny"], (255, 230, 230), box_x + 10, box_y + box_h // 2, anchor="midleft")
+
+
+def _run_update_task(state, source, fn, clear_on_success=True):
+    try:
+        fn()
+        if clear_on_success:
+            state.clear_runtime_error(source)
+    except Exception as e:
+        print(f"{source} update crash: {e}")
+        state.set_runtime_error(source, f"{type(e).__name__}: {e}")
+
+
 def draw_map(screen, state, fonts, mx, my, mw, mh):
     """Draw the basemap tiles + radar overlay + location dot into a rounded-clipped area."""
     if not state.map_tiles:
@@ -870,14 +1023,14 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
         ly = cy + int((RADIUS - 12) * sy)
         draw_text(screen, label, fonts["tiny"], TEXT_DIM, lx, ly, anchor="center")
 
-    cur = state.weather["current_weather"] if state.weather else None
+    cur = state.weather["current"] if state.weather else None
     if cur is None:
         draw_text(screen, "Wind", fonts["tiny"], TEXT_DIM, cx, cy + RADIUS + 8, anchor="center")
         return
 
-    speed_kmh = cur.get("windspeed", 0)
+    speed_kmh = cur.get("wind_speed_10m", 0)
     speed_mph = speed_kmh * 0.621371
-    direction = cur.get("winddirection", 0)  # meteorological: wind coming FROM this bearing
+    direction = cur.get("wind_direction_10m", 0)  # meteorological: wind coming FROM this bearing
 
     # Arrow tip points FROM where wind originates (i.e. toward that compass direction)
     # e.g. SW wind (225°) -> arrow tip points toward SW
@@ -1217,7 +1370,7 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
     hourly = (state.weather or {}).get("hourly", {})
     times  = hourly.get("time", [])
     temps  = hourly.get("temperature_2m", [])
-    humids = hourly.get("relativehumidity_2m", [])
+    humids = hourly.get("relative_humidity_2m", [])
 
     if not times or not temps or not humids:
         draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
@@ -1392,24 +1545,36 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
 def draw_screen(screen, state, fonts, tick):
     screen.fill(BG)
     W, H = screen.get_size()
+    from datetime import timedelta as _td
 
     with state.lock:
+        runtime_error_source = state.runtime_error_source
+        runtime_error_message = state.runtime_error_message
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
 
-
-        if not state.weather:
-            draw_text(screen, state.motd, fonts["small"], GOLD, W//2, H//2, anchor="center")
-            return
-
-        cur, daily = state.weather["current_weather"], state.weather["daily"]
+        cur = (state.weather or {}).get("current")
+        daily = (state.weather or {}).get("daily")
+        has_current = bool(cur and "temperature_2m" in cur and "weather_code" in cur)
+        has_daily = bool(
+            daily
+            and len(daily.get("time", [])) >= 7
+            and len(daily.get("weather_code", [])) >= 7
+            and len(daily.get("temperature_2m_max", [])) >= 7
+            and len(daily.get("temperature_2m_min", [])) >= 7
+            and len(daily.get("precipitation_sum", [])) >= 7
+        )
 
         # Current temp + icon
-        temp_str = f"{round(cur['temperature'])}°"
-        temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
-        screen.blit(temp_surf, (60, 140))
-        icon_x = 60 + temp_surf.get_width() + 18 + 65
-        draw_weather_icon(screen, cur['weathercode'], icon_x, 195, 130, GOLD)
+        if has_current:
+            temp_str = f"{round(cur['temperature_2m'])}°"
+            temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
+            screen.blit(temp_surf, (60, 140))
+            icon_x = 60 + temp_surf.get_width() + 18 + 65
+            draw_weather_icon(screen, cur["weather_code"], icon_x, 195, 130, GOLD)
+        else:
+            draw_text(screen, "Forecast unavailable", fonts["small"], GOLD, 60, 172)
+            draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
 
 
         # Map box
@@ -1423,26 +1588,33 @@ def draw_screen(screen, state, fonts, tick):
         for i in range(7):
             ry = 140 + (i * 120)
             pygame.draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
-            dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
-            code = daily["weathercode"][i]
-            draw_weather_icon(screen, code, W-407, ry+55, 46, GOLD)
-            draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
-            desc = WMO_DESC.get(code, "")
-            draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
-            hi_raw = round(daily["temperature_2m_max"][i])
-            lo_raw = round(daily["temperature_2m_min"][i])
-            nws = state.nws_hilo.get(daily["time"][i])
-            hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
-            lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
-            draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
-            draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+52)
-            # Precipitation on its own bottom row, right-aligned — no overlap with desc or lo temp
-            precip_mm = daily["precipitation_sum"][i]
-            precip_in = precip_mm / 25.4
-            if precip_in > 0.01:
-                draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-45, ry+78, anchor="topright")
+            if has_daily:
+                dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
+                code = daily["weather_code"][i]
+                draw_weather_icon(screen, code, W-407, ry+55, 46, GOLD)
+                draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
+                desc = WMO_DESC.get(code, "")
+                draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
+                hi_raw = round(daily["temperature_2m_max"][i])
+                lo_raw = round(daily["temperature_2m_min"][i])
+                nws = state.nws_hilo.get(daily["time"][i])
+                hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
+                lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
+                draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
+                draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+52)
+                precip_mm = daily["precipitation_sum"][i]
+                precip_in = precip_mm / 25.4
+                if precip_in > 0.01:
+                    draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-45, ry+78, anchor="topright")
+                else:
+                    draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
             else:
-                draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
+                dt = datetime.now() + _td(days=i)
+                draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
+                draw_text(screen, "No forecast", fonts["small"], TEXT_DIM, W-372, ry+50)
+                draw_text(screen, "--", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
+                draw_text(screen, "--", fonts["small"], TEXT_DIM, W-178, ry+52)
+                draw_text(screen, "N/A", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
 
         # Left-column dynamic layout — positions and heights computed by _left_column_layout()
         for _wkey, _wy, _wh in _left_column_layout():
@@ -1460,6 +1632,8 @@ def draw_screen(screen, state, fonts, tick):
                 draw_nflstats_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "RAM_PRICE":
                 draw_ram_widget(screen, state, fonts, _COL_X, _wy)
+
+        draw_error_banner(screen, fonts, W, H, runtime_error_source, runtime_error_message)
 
 
     # MOTD — shrink font until it fits within the screen width with padding
@@ -1500,42 +1674,32 @@ def main():
 
     state = AppState()
 
-    threading.Thread(target=state.update_weather, daemon=True).start()
-    threading.Thread(target=state.update_quotes,  daemon=True).start()
+    def _spawn(source, fn, clear_on_success=True):
+        threading.Thread(
+            target=_run_update_task,
+            args=(state, source, fn, clear_on_success),
+            daemon=True,
+        ).start()
+
+    def _spawn_delayed(delay_s, source, fn, clear_on_success=True):
+        def _delayed():
+            time.sleep(delay_s)
+            _run_update_task(state, source, fn, clear_on_success)
+
+        threading.Thread(target=_delayed, daemon=True).start()
+
+    _spawn("WEATHER", state.update_weather, clear_on_success=False)
+    _spawn("QUOTES", state.update_quotes)
     state.last_weather_upd = time.time()
     state.last_map_upd = time.time()
     state.last_ram_upd = time.time()
 
-    def _delayed_map_start():
-        time.sleep(5)
-        state.update_map()
-
-    def _delayed_ram_start():
-        time.sleep(8)
-        state.update_ram()
-
-    def _delayed_tide_start():
-        time.sleep(3)
-        state.update_tides()
-
-    def _delayed_osv_start():
-        time.sleep(6)
-        state.update_osv()
-
-    def _delayed_potomac_start():
-        time.sleep(7)
-        state.update_potomac()
-
-    def _delayed_nfl_start():
-        time.sleep(9)
-        state.update_nflstats()
-
-    threading.Thread(target=_delayed_map_start,     daemon=True).start()
-    if FEATURES["RAM_PRICE"]: threading.Thread(target=_delayed_ram_start,     daemon=True).start()
-    if FEATURES["OSV_TIDES"]: threading.Thread(target=_delayed_tide_start,    daemon=True).start()
-    if FEATURES["OSV_COUNT"]: threading.Thread(target=_delayed_osv_start,     daemon=True).start()
-    if FEATURES["POTOMAC"]:   threading.Thread(target=_delayed_potomac_start, daemon=True).start()
-    if FEATURES["NFLSTATS"] and NFL_API_KEY: threading.Thread(target=_delayed_nfl_start, daemon=True).start()
+    _spawn_delayed(5, "MAP", state.update_map)
+    if FEATURES["RAM_PRICE"]: _spawn_delayed(8, "RAM", state.update_ram)
+    if FEATURES["OSV_TIDES"]: _spawn_delayed(3, "TIDES", state.update_tides)
+    if FEATURES["OSV_COUNT"]: _spawn_delayed(6, "OSV", state.update_osv)
+    if FEATURES["POTOMAC"]:   _spawn_delayed(7, "POTOMAC", state.update_potomac)
+    if FEATURES["NFLSTATS"] and NFL_API_KEY: _spawn_delayed(9, "NFL", state.update_nflstats)
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -1547,25 +1711,25 @@ def main():
         now = time.time()
         if now - state.last_weather_upd > 60 and not state._weather_running:
             state.last_weather_upd = now
-            threading.Thread(target=state.update_weather, daemon=True).start()
+            _spawn("WEATHER", state.update_weather, clear_on_success=False)
         if now - state.last_map_upd > 60 and not state._map_running:
             state.last_map_upd = now
-            threading.Thread(target=state.update_map, daemon=True).start()
+            _spawn("MAP", state.update_map)
         if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
             state.last_ram_upd = now
-            threading.Thread(target=state.update_ram, daemon=True).start()
+            _spawn("RAM", state.update_ram)
         if now - state.last_tide_upd > 300 and not state._tide_running and FEATURES["OSV_TIDES"]:
             state.last_tide_upd = now
-            threading.Thread(target=state.update_tides, daemon=True).start()
+            _spawn("TIDES", state.update_tides)
         if now - state.last_osv_upd > 60 and not state._osv_running and FEATURES["OSV_COUNT"]:
             state.last_osv_upd = now
-            threading.Thread(target=state.update_osv, daemon=True).start()
+            _spawn("OSV", state.update_osv)
         if now - state.last_potomac_upd > 300 and not state._potomac_running and FEATURES["POTOMAC"]:
             state.last_potomac_upd = now
-            threading.Thread(target=state.update_potomac, daemon=True).start()
+            _spawn("POTOMAC", state.update_potomac)
         if now - state.last_nfl_upd > 300 and not state._nfl_running and FEATURES["NFLSTATS"] and NFL_API_KEY:
             state.last_nfl_upd = now
-            threading.Thread(target=state.update_nflstats, daemon=True).start()
+            _spawn("NFL", state.update_nflstats)
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()
