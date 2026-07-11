@@ -540,8 +540,7 @@ class AppState:
                f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
                f"&hourly=temperature_2m,relative_humidity_2m,precipitation_probability"
                f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
-               f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7"
-               f"&models=gfs_global")
+               f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7")
         raw = safe_fetch(url, timeout=20, retries=3, retry_delay=2.0)
         if raw == "RATE_LIMITED":
             self.backoff_until = time.time() + 1800
