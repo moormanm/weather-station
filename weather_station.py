@@ -14,6 +14,7 @@ import hashlib
 import urllib.request
 import urllib.error
 import socket
+import subprocess
 import random
 import re
 import io
@@ -56,6 +57,8 @@ NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_sectio
 SCREEN_W, SCREEN_H = 1920, 1080
 
 MAP_ZOOM = 7  # zoom level for both basemap and radar tiles (RainViewer max = 7)
+SELF_UPDATE_INTERVAL_S = config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=6 * 3600)
+SELF_UPDATE_TIMEOUT_S = 120
 
 def _loc_pixel_offset(lat, lon, zoom):
     """Sub-tile pixel offset of exact location from center of its tile at given zoom."""
@@ -379,23 +382,50 @@ def _fetch_nws_hilo(forecast_url, stations_url):
         print(f"NWS forecast fetch error: {e}")
 
     try:
+        # Current observed temp from nearest NWS station.
+        # Use /latest to avoid stale ordering/caching issues in the /observations list.
+        latest_url = stations_url.split("?", 1)[0].rstrip("/") + "/latest?require_qc=true"
+        latest_raw = safe_fetch(latest_url, timeout=15, retries=2)
+        if latest_raw and latest_raw != "RATE_LIMITED":
+            latest_props = json.loads(latest_raw.decode()).get("properties", {})
+            t_obj = latest_props.get("temperature") or {}
+            t_c = t_obj.get("value")
+            if t_c is not None:
+                current_obs_temp_f = t_c * 9 / 5 + 32
+    except Exception as e:
+        print(f"NWS latest observation fetch error: {e}")
+
+    try:
         # Today's observed high from nearest NWS observation station
         raw = safe_fetch(stations_url, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
             obs = json.loads(raw.decode())["features"]
             today = datetime.now().strftime("%Y-%m-%d")
             today_temps = []
+            newest_ts = None
+            newest_temp_f = None
             for o in obs:
                 props = o.get("properties", {})
                 ts = props.get("timestamp")
                 t_obj = props.get("temperature") or {}
                 t_c = t_obj.get("value")
                 if ts and t_c is not None:
-                    t_f = t_c * 9/5 + 32
-                    if current_obs_temp_f is None:
-                        current_obs_temp_f = t_f
+                    t_f = t_c * 9 / 5 + 32
                     if ts[:10] == today:
                         today_temps.append(t_f)
+
+                    # Fallback in case /latest fails.
+                    try:
+                        ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        ts_dt = None
+                    if ts_dt is not None and (newest_ts is None or ts_dt > newest_ts):
+                        newest_ts = ts_dt
+                        newest_temp_f = t_f
+
+            if current_obs_temp_f is None and newest_temp_f is not None:
+                current_obs_temp_f = newest_temp_f
+
             if today_temps:
                 obs_hi = round(max(today_temps))
                 existing = hilo.get(today, (None, None))
@@ -968,6 +998,75 @@ def _run_update_task(state, source, fn, clear_on_success=True):
         state.set_runtime_error(source, f"{type(e).__name__}: {e}")
 
 
+def _git_head(repo_dir):
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        return proc.stdout.strip()
+    except Exception as e:
+        print(f"Self-update: git rev-parse failed: {e}")
+        return None
+
+
+def _maybe_self_update_and_restart(repo_dir):
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+
+    before = _git_head(repo_dir)
+    print("Self-update: running git pull")
+    try:
+        pull = subprocess.run(
+            ["git", "pull"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=SELF_UPDATE_TIMEOUT_S,
+        )
+    except Exception as e:
+        print(f"Self-update: git pull failed: {e}")
+        return False
+
+    stdout = (pull.stdout or "").strip()
+    stderr = (pull.stderr or "").strip()
+    if stdout:
+        print(f"Self-update git pull stdout: {stdout}")
+    if stderr:
+        print(f"Self-update git pull stderr: {stderr}")
+    if pull.returncode != 0:
+        print(f"Self-update: git pull exited with status {pull.returncode}")
+        return False
+
+    after = _git_head(repo_dir)
+    combined = f"{stdout}\n{stderr}"
+    already_up_to_date = (
+        "Already up to date." in combined
+        or "Already up-to-date." in combined
+    )
+    if before and after:
+        updated = before != after
+    else:
+        updated = not already_up_to_date
+
+    if not updated:
+        print("Self-update: no remote updates found")
+        return False
+
+    script_path = os.path.abspath(__file__)
+    print("Self-update: updates found, launching fresh process")
+    try:
+        subprocess.Popen([sys.executable, script_path], cwd=repo_dir)
+        return True
+    except Exception as e:
+        print(f"Self-update: failed to launch fresh process: {e}")
+        return False
+
+
 def draw_map(screen, state, fonts, mx, my, mw, mh):
     """Draw the basemap tiles + radar overlay + location dot into a rounded-clipped area."""
     if not state.map_tiles:
@@ -1476,7 +1575,7 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
     panel_y = y + TITLE_H
     panel_h = h - TITLE_H
     pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
-    draw_text(screen, "Next 8 Hours Precip Chance", fonts["tiny"], TEXT_DIM, x, y + 4)
+    draw_text(screen, "Rain Chance by Hour", fonts["tiny"], TEXT_DIM, x, y + 4)
 
     hourly = (state.weather or {}).get("hourly", {})
     s_times, s_pops = _hourly_series(hourly, "precipitation_probability")
@@ -1514,30 +1613,31 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         gy = _py(pct)
         pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
-    for i in range(n):
-        pygame.draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
+    slot_w = chart_w / max(1, n)
+    bar_w = max(12, min(34, int(slot_w * 0.72)))
 
-    bar_w = max(10, min(26, int(chart_w / max(1, n * 1.8))))
-    p_pts = []
+    for i in range(1, n):
+        gx = chart_x + int(i * slot_w)
+        pygame.draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
+
     for i, pct in enumerate(s_pops):
-        cx = _cx(i)
+        cx = chart_x + int((i + 0.5) * slot_w)
         py = _py(pct)
-        p_pts.append((cx, py))
+        shade = (74, 124, 188) if i == 0 else (56, 102, 160)
+        edge = RAIN if i == 0 else (126, 170, 228)
         rect_h = max(1, chart_y + chart_h - py)
-        pygame.draw.rect(screen, (56, 102, 160), (cx - bar_w // 2, py, bar_w, rect_h), border_radius=3)
-        pygame.draw.circle(screen, RAIN if i == 0 else (126, 170, 228), (cx, py), 4 if i == 0 else 3)
-        lbl_y = max(chart_y + 10, py - 3)
+        pygame.draw.rect(screen, shade, (cx - bar_w // 2, py, bar_w, rect_h), border_radius=4)
+        pygame.draw.rect(screen, edge, (cx - bar_w // 2, py, bar_w, rect_h), 1, border_radius=4)
+        lbl_y = max(chart_y + 10, py - 2)
         draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], (170, 210, 255), cx, lbl_y, anchor="midbottom")
 
-    if len(p_pts) >= 2:
-        pygame.draw.lines(screen, RAIN, False, p_pts, 2)
-
     hour_y = chart_y + chart_h + 2
-    for i, t_str in enumerate(s_times):
-        hr = int(t_str[11:13])
+    for i in range(1, n):
+        hr = int(s_times[i][11:13])
         ampm = "a" if hr < 12 else "p"
         h12 = hr % 12 or 12
-        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), hour_y, anchor="midtop")
+        draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM,
+                  chart_x + int(i * slot_w), hour_y, anchor="midtop")
 
 
 def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
@@ -1783,6 +1883,8 @@ def main():
     }
 
     state = AppState()
+    repo_dir = os.path.dirname(os.path.abspath(__file__))
+    next_self_update_check = time.time() + SELF_UPDATE_INTERVAL_S
 
     def _spawn(source, fn, clear_on_success=True):
         threading.Thread(
@@ -1819,6 +1921,11 @@ def main():
                 sys.exit()
 
         now = time.time()
+        if now >= next_self_update_check:
+            next_self_update_check = now + SELF_UPDATE_INTERVAL_S
+            if _maybe_self_update_and_restart(repo_dir):
+                pygame.quit()
+                sys.exit(0)
         if now - state.last_weather_upd > 60 and not state._weather_running:
             state.last_weather_upd = now
             _spawn("WEATHER", state.update_weather, clear_on_success=False)

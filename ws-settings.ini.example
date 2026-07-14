@@ -26,5 +26,9 @@ HOURLY_FORECAST=false
 SUNTIME=false
 POTOMAC=false
 
+[GENERAL]
+# Self update check interval (in seconds). Default: 6 hours.
+SELF_UPDATE_INTERVAL_S=21600
+
 [NFLSTATS]
 API-KEY=
