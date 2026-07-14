@@ -16,7 +16,6 @@ cp ws-settings.ini.example ~/ws-settings.ini
 ```bash
 # Activate venv (either works — both have only pygame==2.6.1)
 source .venv/bin/activate   # preferred: subdirectory venv
-# OR: source bin/activate   # root-level venv (same Python, same packages)
 
 # Run (requires a display — $DISPLAY or Wayland)
 python weather_station.py
