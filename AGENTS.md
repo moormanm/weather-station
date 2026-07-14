@@ -45,7 +45,7 @@ The left column (x=60–520, y=350–1000) is managed by `_left_column_layout()`
 
 ## Features / widgets
 
-All features are off by default. Enable in `~/ws-settings.ini` under `[FEATURES]`:
+Some features are off by default. Enable in `~/ws-settings.ini` under `[FEATURES]`:
 
 | Key | Widget | Growable? | Notes |
 |---|---|---|---|
