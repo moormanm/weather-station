@@ -1060,7 +1060,9 @@ def _maybe_self_update_and_restart(repo_dir):
     script_path = os.path.abspath(__file__)
     print("Self-update: updates found, launching fresh process")
     try:
-        subprocess.Popen([sys.executable, script_path], cwd=repo_dir)
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.Popen([sys.executable, "-u", script_path], cwd=repo_dir, env=env)
         return True
     except Exception as e:
         print(f"Self-update: failed to launch fresh process: {e}")
