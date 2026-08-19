@@ -35,6 +35,10 @@ config.read(config_path)
 
 LATITUDE = config.getfloat("LOCATION", "LATITUDE")
 LONGITUDE = config.getfloat("LOCATION", "LONGITUDE")
+
+MAP_LAT = config.getfloat("LOCATION", "MAP_LAT", fallback=LATITUDE)
+MAP_LONG = config.getfloat("LOCATION", "MAP_LONG", fallback=LONGITUDE)
+
 LOCATION_NAME = config.get("LOCATION", "NAME")
 
 FEATURES = {
@@ -70,7 +74,15 @@ def _loc_pixel_offset(lat, lon, zoom):
     fy = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n - yt
     return int(fx * 256 - 128), int(fy * 256 - 128)
 
-LOC_DOT_OFFSET = _loc_pixel_offset(LATITUDE, LONGITUDE, MAP_ZOOM)
+def _tile_xy(lat, lon, zoom):
+    """Return the integer Web-Mercator tile x/y containing a location."""
+    n = 2 ** zoom
+    lat_rad = math.radians(lat)
+    x = int((lon + 180.0) / 360.0 * n)
+    y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
+    return x, y
+
+LOC_DOT_OFFSET = (0,0)  # computed dynamically
 
 USER_AGENT = "FrederickWeatherStation/1.8 (RPi3B+; Dashboard)"
 HEADERS = {"User-Agent": USER_AGENT}
@@ -487,6 +499,7 @@ class AppState:
         self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
         self.obs_temp_f = None          # nearest NWS station current temp in Fahrenheit
         self.map_tiles = {}
+        self.map_label_tiles = {}
         self.radar_tiles = {}
         self.last_weather_upd = 0
         self.last_map_upd = 0
@@ -608,16 +621,17 @@ class AppState:
 
     def _do_update_map(self):
         zoom = MAP_ZOOM  # 7
-        lat_rad = math.radians(LATITUDE)
+        lat_rad = math.radians(MAP_LAT)
         n = 2 ** zoom
-        xt = int((LONGITUDE + 180.0) / 360.0 * n)
+        xt = int((MAP_LONG + 180.0) / 360.0 * n)
         yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
 
         # 3×3 basemap tiles at zoom 7
         new_tiles = {}
         for dy in range(-1, 2):
             for dx in range(-1, 2):
-                url = f"https://basemaps.cartocdn.com/light_all/{zoom}/{xt+dx}/{yt+dy}.png"
+                # ArcGIS World Imagery (Esri), using the standard XYZ tile scheme.
+                url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{yt+dy}/{xt+dx}"
                 fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
                 if os.path.exists(fname):
                     with open(fname, "rb") as f:
@@ -629,6 +643,38 @@ class AppState:
                             f.write(data)
                 if data and data != "RATE_LIMITED":
                     new_tiles[(dx, dy)] = data
+
+        # ArcGIS place-name/reference overlay. World Imagery intentionally has
+        # no city labels, so draw Esri's transparent reference layer over it.
+        # This supplies city/town names while leaving the aerial imagery visible.
+        new_label_tiles = {}
+        for dy in range(-1, 2):
+            for dx in range(-1, 2):
+                label_url = (
+                    f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                    f"Reference/World_Boundaries_and_Places/MapServer/tile/"
+                    f"{zoom}/{yt+dy}/{xt+dx}"
+                )
+                label_fname = os.path.join(
+                    TILE_CACHE_DIR, hashlib.md5(label_url.encode()).hexdigest() + ".png"
+                )
+                label_data = None
+                if os.path.exists(label_fname):
+                    try:
+                        with open(label_fname, "rb") as f:
+                            label_data = f.read()
+                    except Exception:
+                        label_data = None
+                if not label_data:
+                    label_data = safe_fetch(label_url, timeout=5)
+                    if label_data and label_data != "RATE_LIMITED" and len(label_data) > 100:
+                        try:
+                            with open(label_fname, "wb") as f:
+                                f.write(label_data)
+                        except Exception:
+                            pass
+                if label_data and label_data != "RATE_LIMITED":
+                    new_label_tiles[(dx, dy)] = label_data
 
         # Radar — fetch same 3×3 grid of zoom-7 tiles as basemap so all nearby
         # precipitation is visible, not just what falls on the single center tile.
@@ -653,6 +699,7 @@ class AppState:
 
         with self.lock:
             self.map_tiles = new_tiles
+            self.map_label_tiles = new_label_tiles
             self.radar_tiles = new_radar_tiles
             self.last_map_upd = time.time()
 
@@ -1070,57 +1117,105 @@ def _maybe_self_update_and_restart(repo_dir):
 
 
 def draw_map(screen, state, fonts, mx, my, mw, mh):
-    """Draw the basemap tiles + radar overlay + location dot into a rounded-clipped area."""
+    """Draw the map centered on MAP_LAT/MAP_LONG and the weather marker at LATITUDE/LONGITUDE."""
     if not state.map_tiles:
         return
 
-    # Render tiles onto an intermediate surface the size of the tile grid (768×768)
+    TILE = 256.0
+    zoom = MAP_ZOOM
+    n = 2 ** zoom
+
+    # MAP_LAT/MAP_LONG define the exact geographic point at the center
+    # of the displayed map.  They are used only by the map renderer.
+    map_lat_rad = math.radians(MAP_LAT)
+    map_world_x = (MAP_LONG + 180.0) / 360.0 * n * TILE
+    map_world_y = (1.0 - math.log(
+        math.tan(map_lat_rad) + 1 / math.cos(map_lat_rad)
+    ) / math.pi) / 2.0 * n * TILE
+
+    # The downloaded 3x3 grid is indexed relative to the tile containing
+    # MAP_LAT/MAP_LONG.  Shift every tile by the fractional position of the
+    # exact map center so that MAP_LAT/MAP_LONG is precisely at (384,384).
+    center_xt = int(map_world_x // TILE)
+    center_yt = int(map_world_y // TILE)
+
     tile_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
     tile_ox = (mw - 768) // 2
     tile_oy = (mh - 768) // 2
 
+    def tile_position(dx, dy):
+        tx = center_xt + dx
+        ty = center_yt + dy
+        return (int(round(384.0 + tx * TILE - map_world_x)),
+                int(round(384.0 + ty * TILE - map_world_y)))
+
+    # Basemap: these tiles were selected using MAP_LAT/MAP_LONG.
     for (dx, dy), d in state.map_tiles.items():
         try:
             img = pygame.image.load(io.BytesIO(d)).convert_alpha()
-            tile_surf.blit(img, ((dx + 1) * 256, (dy + 1) * 256))
+            tile_surf.blit(img, tile_position(dx, dy))
         except Exception:
             pass
 
-    # Radar overlay: blit each tile at the same position as its basemap counterpart
+    # Radar uses the same geographic tile positions as the basemap.
     for (dx, dy), blob in state.radar_tiles.items():
         try:
             rd = pygame.image.load(io.BytesIO(blob)).convert_alpha()
             rd.set_alpha(180)
-            tile_surf.blit(rd, ((dx + 1) * 256, (dy + 1) * 256))
+            tile_surf.blit(rd, tile_position(dx, dy))
         except Exception as e:
             print(f"Radar draw error: {e}")
 
-    # Location dot on the tile surface
-    dot_x = 256 + 128 + LOC_DOT_OFFSET[0]  # center of center tile + sub-tile offset
-    dot_y = 256 + 128 + LOC_DOT_OFFSET[1]
+    # ArcGIS city/place-name reference layer.
+    for (dx, dy), blob in state.map_label_tiles.items():
+        try:
+            labels = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+            tile_surf.blit(labels, tile_position(dx, dy))
+        except Exception as e:
+            print(f"Map label draw error: {e}")
+
+    # ------------------------------------------------------------------
+    # WEATHER LOCATION -- LATITUDE/LONGITUDE ONLY
+    # ------------------------------------------------------------------
+    # Project the actual weather coordinates into the same world-pixel
+    # coordinate system.  This does not use MAP_LAT or MAP_LONG.
+    weather_lat_rad = math.radians(LATITUDE)
+    weather_world_x = (LONGITUDE + 180.0) / 360.0 * n * TILE
+    weather_world_y = (1.0 - math.log(
+        math.tan(weather_lat_rad) + 1 / math.cos(weather_lat_rad)
+    ) / math.pi) / 2.0 * n * TILE
+
+    # Because MAP_LAT/MAP_LONG is the exact center of the map, the exact
+    # weather coordinate is simply its world-pixel displacement from that
+    # independent map center.
+    dot_x = int(round(384.0 + weather_world_x - map_world_x))
+    dot_y = int(round(384.0 + weather_world_y - map_world_y))
+
     pygame.draw.circle(tile_surf, (0, 0, 0), (dot_x, dot_y), 8)
     pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
     pygame.draw.circle(tile_surf, (255, 255, 255), (dot_x, dot_y), 2)
 
-    # Label the configured location name next to the marker.
+    # LOCATION_NAME is anchored to the exact LATITUDE/LONGITUDE marker.
     label_font = fonts["tiny"]
     label_img = label_font.render(LOCATION_NAME, True, TEXT_BRIGHT)
     label_pad_x, label_pad_y = 8, 4
     label_w, label_h = label_img.get_size()
-    label_x = dot_x + 12 if dot_x < 384 else dot_x - 12 - (label_w + label_pad_x * 2)
-    label_y = dot_y - (label_h // 2) - label_pad_y
-    label_x = max(6, min(label_x, 768 - label_w - label_pad_x * 2 - 6))
-    label_y = max(6, min(label_y, 768 - label_h - label_pad_y * 2 - 6))
-    label_box = pygame.Rect(label_x, label_y, label_w + label_pad_x * 2, label_h + label_pad_y * 2)
+    label_box_w = label_w + label_pad_x * 2
+    label_box_h = label_h + label_pad_y * 2
+
+    label_x = dot_x - label_box_w // 2
+    label_y = dot_y - label_box_h - 12
+    label_x = max(6, min(label_x, 768 - label_box_w - 6))
+    label_y = max(6, min(label_y, 768 - label_box_h - 6))
+    label_box = pygame.Rect(label_x, label_y, label_box_w, label_box_h)
     pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
     pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
     tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
 
-    # Build a rounded-rect mask and apply it
+    # Rounded clipping mask.
     mask_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
     mask_surf.fill((0, 0, 0, 0))
     pygame.draw.rect(mask_surf, (255, 255, 255, 255), (0, 0, 768, 768), border_radius=16)
-    # Multiply tile_surf alpha by mask
     tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
     screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
@@ -1149,9 +1244,11 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
     speed_mph = speed_kmh * 0.621371
     direction = cur.get("wind_direction_10m", 0)  # meteorological: wind coming FROM this bearing
 
-    # Arrow tip points FROM where wind originates (i.e. toward that compass direction)
-    # e.g. SW wind (225°) -> arrow tip points toward SW
-    from_rad = math.radians(direction)
+    # Open-Meteo reports meteorological direction as the direction the wind
+    # comes FROM.  The display arrow should point in the direction the wind
+    # is going TO, exactly 180 degrees opposite.
+    to_direction = (direction + 180.0) % 360.0
+    from_rad = math.radians(to_direction)
     arrow_len = RADIUS - 22   # shorter, tighter
     head_len  = 9
 
