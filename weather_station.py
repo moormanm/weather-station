@@ -1269,7 +1269,7 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
     compass = dirs[round(direction / 22.5) % 16]
 
     draw_text(screen, f"{round(speed_mph)} mph", fonts["tiny"], TEXT_BRIGHT, cx, cy + RADIUS + 8,  anchor="center")
-    draw_text(screen, compass,                   fonts["tiny"], TEXT_DIM,    cx, cy + RADIUS + 26, anchor="center")
+    draw_text(screen, f"from {compass}",         fonts["tiny"], TEXT_DIM,    cx, cy + RADIUS + 26, anchor="center")
 
 
 def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
