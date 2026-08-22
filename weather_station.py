@@ -52,7 +52,7 @@ FEATURES = {
         fallback=config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
     ),
     "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
-    "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=True),
+    "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=False),
     "NFLSTATS":        config.getboolean("FEATURES", "NFLSTATS",        fallback=False),
 }
 
@@ -451,6 +451,53 @@ def _fetch_nws_hilo(forecast_url, stations_url):
     return hilo, current_obs_temp_f
 
 
+def _fetch_nws_hourly_pop(forecast_url):
+    """Return ({hourly: {time: [], precipitation_probability: []}}, source_label) from NWS hourly."""
+    hourly_url = forecast_url.rstrip("/") + "/hourly"
+    raw = safe_fetch(hourly_url, timeout=15, retries=2)
+    if not raw or raw == "RATE_LIMITED":
+        return {"hourly": {"time": [], "precipitation_probability": []}}, "NWS"
+
+    periods = json.loads(raw.decode()).get("properties", {}).get("periods", [])
+    times, pops = [], []
+    for p in periods[:48]:
+        start = p.get("startTime")
+        pop_obj = p.get("probabilityOfPrecipitation") or {}
+        pop_val = pop_obj.get("value")
+        if not start:
+            continue
+        try:
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            times.append(dt.strftime("%Y-%m-%dT%H:00"))
+        except Exception:
+            continue
+        pops.append(0 if pop_val is None else max(0, min(100, int(round(float(pop_val))))))
+    return {"hourly": {"time": times, "precipitation_probability": pops}}, "NWS"
+
+
+def _fetch_nws_hourly_temp(forecast_url):
+    """Return ({hourly: {time: [], temperature_2m: []}}, source_label) from NWS hourly."""
+    hourly_url = forecast_url.rstrip("/") + "/hourly"
+    raw = safe_fetch(hourly_url, timeout=15, retries=2)
+    if not raw or raw == "RATE_LIMITED":
+        return {"hourly": {"time": [], "temperature_2m": []}}, "NWS"
+
+    periods = json.loads(raw.decode()).get("properties", {}).get("periods", [])
+    times, temps = [], []
+    for p in periods[:48]:
+        start = p.get("startTime")
+        temp_f = p.get("temperature")
+        if not start or temp_f is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            times.append(dt.strftime("%Y-%m-%dT%H:00"))
+            temps.append(float(temp_f))
+        except Exception:
+            continue
+    return {"hourly": {"time": times, "temperature_2m": temps}}, "NWS"
+
+
 def _load_ram_history():
     try:
         with open(RAM_HISTORY_FILE, "r") as f:
@@ -498,6 +545,8 @@ class AppState:
         self.weather = None
         self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
         self.obs_temp_f = None          # nearest NWS station current temp in Fahrenheit
+        self.nws_hourly_precip = None   # NWS hourly POP data mapped to open-meteo style hourly keys
+        self.nws_hourly_temp = None     # NWS hourly temp data mapped to open-meteo style hourly keys
         self.map_tiles = {}
         self.map_label_tiles = {}
         self.radar_tiles = {}
@@ -594,10 +643,16 @@ class AppState:
             try:
                 data = json.loads(raw.decode())
                 nws_hilo, obs_temp_f = _fetch_nws_hilo(forecast_url, stations_url)
+                nws_hourly_precip, nws_hourly_source = _fetch_nws_hourly_pop(forecast_url)
+                nws_hourly_temp, nws_hourly_temp_source = _fetch_nws_hourly_temp(forecast_url)
                 with self.lock:
                     self.weather = data
                     self.nws_hilo = nws_hilo
                     self.obs_temp_f = obs_temp_f
+                    self.nws_hourly_precip = nws_hourly_precip
+                    self.nws_hourly_source = nws_hourly_source
+                    self.nws_hourly_temp = nws_hourly_temp
+                    self.nws_hourly_temp_source = nws_hourly_temp_source
                     self.weather_loaded_once = True
                     self.last_weather_upd = time.time()
                 self.clear_runtime_error("WEATHER")
@@ -1225,51 +1280,73 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
     """Compass rose with arrow pointing toward where wind is going.
     cx, cy = center of circle."""
     RADIUS = 52
+    cur = state.weather["current"] if state.weather else None
 
-    pygame.draw.circle(screen, PANEL, (cx, cy), RADIUS)
-    pygame.draw.circle(screen, TEXT_DIM, (cx, cy), RADIUS, 1)
+    if cur is None:
+        line1 = "Wind"
+        line2 = None
+        speed_mph = None
+        direction = 0
+    else:
+        speed_kmh = cur.get("wind_speed_10m", 0)
+        speed_mph = speed_kmh * 0.621371
+        direction = cur.get("wind_direction_10m", 0)  # meteorological: wind coming FROM this bearing
+        dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+                "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+        compass = dirs[round(direction / 22.5) % 16]
+        line1 = f"{round(speed_mph)} mph"
+        line2 = f"from {compass}"
+
+    line1_img = fonts["tiny"].render(line1, True, TEXT_BRIGHT if speed_mph is not None else TEXT_DIM)
+    line2_img = fonts["tiny"].render(line2, True, TEXT_DIM) if line2 else None
+    widget_w = max(
+        RADIUS * 2 + 2,
+        line1_img.get_width(),
+        line2_img.get_width() if line2_img else 0,
+    ) + 8
+    if widget_w % 2:
+        widget_w += 1
+    widget_h = (RADIUS * 2) + 42
+
+    ws = pygame.Surface((widget_w, widget_h), pygame.SRCALPHA)
+    wcx = widget_w // 2
+    wcy = RADIUS + 1
+
+    pygame.draw.circle(ws, PANEL, (wcx, wcy), RADIUS)
+    pygame.draw.circle(ws, TEXT_DIM, (wcx, wcy), RADIUS, 1)
 
     # Cardinal labels — placed just inside the rim
     for label, sx, sy in (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("W", -1, 0)):
-        lx = cx + int((RADIUS - 12) * sx)
-        ly = cy + int((RADIUS - 12) * sy)
-        draw_text(screen, label, fonts["tiny"], TEXT_DIM, lx, ly, anchor="center")
+        lx = wcx + int((RADIUS - 12) * sx)
+        ly = wcy + int((RADIUS - 12) * sy)
+        draw_text(ws, label, fonts["tiny"], TEXT_DIM, lx, ly, anchor="center")
 
-    cur = state.weather["current"] if state.weather else None
-    if cur is None:
-        draw_text(screen, "Wind", fonts["tiny"], TEXT_DIM, cx, cy + RADIUS + 8, anchor="center")
-        return
+    if cur is not None:
+        # Open-Meteo reports meteorological direction as the direction the wind
+        # comes FROM.  The display arrow should point in the direction the wind
+        # is going TO, exactly 180 degrees opposite.
+        to_direction = (direction + 180.0) % 360.0
+        from_rad = math.radians(to_direction)
+        arrow_len = RADIUS - 22
+        head_len  = 9
 
-    speed_kmh = cur.get("wind_speed_10m", 0)
-    speed_mph = speed_kmh * 0.621371
-    direction = cur.get("wind_direction_10m", 0)  # meteorological: wind coming FROM this bearing
+        tip_x  = wcx + int(arrow_len * math.sin(from_rad))
+        tip_y  = wcy - int(arrow_len * math.cos(from_rad))
+        tail_x = wcx - int(arrow_len * math.sin(from_rad))
+        tail_y = wcy + int(arrow_len * math.cos(from_rad))
 
-    # Open-Meteo reports meteorological direction as the direction the wind
-    # comes FROM.  The display arrow should point in the direction the wind
-    # is going TO, exactly 180 degrees opposite.
-    to_direction = (direction + 180.0) % 360.0
-    from_rad = math.radians(to_direction)
-    arrow_len = RADIUS - 22   # shorter, tighter
-    head_len  = 9
+        pygame.draw.line(ws, ACCENT, (tail_x, tail_y), (tip_x, tip_y), 2)
+        for side in (+1, -1):
+            wing_rad = from_rad + side * math.radians(145)
+            pygame.draw.line(ws, ACCENT, (tip_x, tip_y),
+                             (tip_x + int(head_len * math.sin(wing_rad)),
+                              tip_y - int(head_len * math.cos(wing_rad))), 2)
 
-    tip_x  = cx + int(arrow_len * math.sin(from_rad))
-    tip_y  = cy - int(arrow_len * math.cos(from_rad))
-    tail_x = cx - int(arrow_len * math.sin(from_rad))
-    tail_y = cy + int(arrow_len * math.cos(from_rad))
+    ws.blit(line1_img, line1_img.get_rect(center=(wcx, wcy + RADIUS + 8)))
+    if line2_img:
+        ws.blit(line2_img, line2_img.get_rect(center=(wcx, wcy + RADIUS + 26)))
 
-    pygame.draw.line(screen, ACCENT, (tail_x, tail_y), (tip_x, tip_y), 2)
-    for side in (+1, -1):
-        wing_rad = from_rad + side * math.radians(145)
-        pygame.draw.line(screen, ACCENT, (tip_x, tip_y),
-                         (tip_x + int(head_len * math.sin(wing_rad)),
-                          tip_y - int(head_len * math.cos(wing_rad))), 2)
-
-    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
-            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    compass = dirs[round(direction / 22.5) % 16]
-
-    draw_text(screen, f"{round(speed_mph)} mph", fonts["tiny"], TEXT_BRIGHT, cx, cy + RADIUS + 8,  anchor="center")
-    draw_text(screen, f"from {compass}",         fonts["tiny"], TEXT_DIM,    cx, cy + RADIUS + 26, anchor="center")
+    screen.blit(ws, (cx - widget_w // 2, cy - wcy))
 
 
 def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
@@ -1586,7 +1663,7 @@ def _hourly_series(hourly, key, n=8):
 
 
 def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
-    """8-hour temperature chart only. x,y = top-left corner; w x h includes title."""
+    """8-hour temperature chart with Open-Meteo (cyan) and NWS (gold) overlaid."""
     TITLE_H = 24
     PAD_L = 10
     PAD_R = 12
@@ -1600,6 +1677,8 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
 
     hourly = (state.weather or {}).get("hourly", {})
     s_times, s_temps = _hourly_series(hourly, "temperature_2m")
+    nws_hourly = (state.nws_hourly_temp or {}).get("hourly", {})
+    nws_times, nws_temps = _hourly_series(nws_hourly, "temperature_2m")
 
     if len(s_times) < 2:
         draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
@@ -1608,6 +1687,7 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
 
     try:
         s_temps = [float(v) for v in s_temps]
+        nws_temps = [float(v) for v in nws_temps]
     except Exception:
         draw_text(screen, "No data", fonts["small"], TEXT_DIM,
                   x + w // 2, panel_y + panel_h // 2, anchor="center")
@@ -1627,8 +1707,9 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
     def _cx(i):
         return chart_x + int(i / max(1, n - 1) * chart_w)
 
-    t_lo = min(s_temps)
-    t_hi = max(s_temps)
+    all_temps = list(s_temps) + list(nws_temps)
+    t_lo = min(all_temps)
+    t_hi = max(all_temps)
     pad = max(2.0, (t_hi - t_lo) * 0.20)
     t_lo -= pad
     t_hi += pad
@@ -1643,17 +1724,48 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         gy = chart_y + int(chart_h * frac)
         pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
-    t_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
-    if len(t_pts) >= 2:
-        pygame.draw.lines(screen, TEMP_NEUTRAL, False, t_pts, 2)
+    om_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
+    if len(om_pts) >= 2:
+        pygame.draw.lines(screen, ACCENT, False, om_pts, 2)
 
-    for i, (px, py) in enumerate(t_pts):
-        pygame.draw.circle(screen, GOLD if i == 0 else TEMP_NEUTRAL, (px, py), 5 if i == 0 else 3)
-        lbl = f"{round(s_temps[i])}\u00b0"
-        if py - chart_y < 14:
-            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py + 6, anchor="midtop")
+    nws_idx = {t: v for t, v in zip(nws_times, nws_temps)}
+    if len(nws_times) >= 2:
+        nws_pts = [(_cx(i), _ty(nws_idx[t])) for i, t in enumerate(s_times) if t in nws_idx]
+        if len(nws_pts) >= 2:
+            pygame.draw.lines(screen, GOLD, False, nws_pts, 2)
+
+    for i, (px, om_py) in enumerate(om_pts):
+        pygame.draw.circle(screen, ACCENT, (px, om_py), 4 if i == 0 else 3)
+
+        has_nws = s_times[i] in nws_idx
+        nws_py = _ty(nws_idx[s_times[i]]) if has_nws else None
+        if has_nws:
+            pygame.draw.circle(screen, GOLD, (px, nws_py), 4 if i == 0 else 3)
+
+        om_lbl = f"{round(s_temps[i])}\u00b0"
+        if has_nws:
+            nws_lbl = f"{round(nws_idx[s_times[i]])}\u00b0"
+            if abs(om_py - nws_py) < 14:
+                if om_py <= nws_py:
+                    draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py - 4, anchor="midbottom")
+                    draw_text(screen, nws_lbl, fonts["tiny"], GOLD, px, nws_py + 6, anchor="midtop")
+                else:
+                    draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py + 6, anchor="midtop")
+                    draw_text(screen, nws_lbl, fonts["tiny"], GOLD, px, nws_py - 4, anchor="midbottom")
+            else:
+                if om_py - chart_y < 14:
+                    draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py + 6, anchor="midtop")
+                else:
+                    draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py - 4, anchor="midbottom")
+                if nws_py - chart_y < 14:
+                    draw_text(screen, nws_lbl, fonts["tiny"], GOLD, px, nws_py + 6, anchor="midtop")
+                else:
+                    draw_text(screen, nws_lbl, fonts["tiny"], GOLD, px, nws_py - 4, anchor="midbottom")
         else:
-            draw_text(screen, lbl, fonts["tiny"], TEMP_NEUTRAL, px, py - 4, anchor="midbottom")
+            if om_py - chart_y < 14:
+                draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py + 6, anchor="midtop")
+            else:
+                draw_text(screen, om_lbl, fonts["tiny"], ACCENT, px, om_py - 4, anchor="midbottom")
 
     hour_y = chart_y + chart_h + 1
     for i, t_str in enumerate(s_times):
@@ -1662,9 +1774,17 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         h12 = hr % 12 or 12
         draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), hour_y, anchor="midtop")
 
+    legend_x = x + 300
+    legend_y = y + 20
+    legend_gap = 24
+    pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+    draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
+    pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+    draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
+
 
 def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
-    """8-hour precipitation chance chart. Separate widget with its own minimum height."""
+    """8-hour precipitation chance chart with Open-Meteo (cyan) and NWS (gold) overlaid."""
     TITLE_H = 24
     PAD_L = 10
     PAD_R = 12
@@ -1674,10 +1794,12 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
     panel_y = y + TITLE_H
     panel_h = h - TITLE_H
     pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
-    draw_text(screen, "Rain Chance by Hour", fonts["tiny"], TEXT_DIM, x, y + 4)
+    draw_text(screen, "Rain Chance", fonts["tiny"], TEXT_DIM, x, y + 4)
 
     hourly = (state.weather or {}).get("hourly", {})
     s_times, s_pops = _hourly_series(hourly, "precipitation_probability")
+    nws_hourly = (state.nws_hourly_precip or {}).get("hourly", {})
+    nws_times, nws_pops = _hourly_series(nws_hourly, "precipitation_probability")
 
     if len(s_times) < 2:
         draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
@@ -1686,6 +1808,7 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
 
     try:
         s_pops = [max(0.0, min(100.0, float(v or 0))) for v in s_pops]
+        nws_pops = [max(0.0, min(100.0, float(v or 0))) for v in nws_pops]
     except Exception:
         draw_text(screen, "No data", fonts["small"], TEXT_DIM,
                   x + w // 2, panel_y + panel_h // 2, anchor="center")
@@ -1702,9 +1825,6 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
                   x + w // 2, panel_y + panel_h // 2, anchor="center")
         return
 
-    def _cx(i):
-        return chart_x + int(i / max(1, n - 1) * chart_w)
-
     def _py(p):
         return chart_y + chart_h - int((p / 100.0) * chart_h)
 
@@ -1713,22 +1833,43 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
     slot_w = chart_w / max(1, n)
-    bar_w = max(12, min(34, int(slot_w * 0.72)))
+    bar_w = max(8, min(18, int(slot_w * 0.36)))
 
     for i in range(1, n):
         gx = chart_x + int(i * slot_w)
         pygame.draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
 
+    nws_by_time = {t: p for t, p in zip(nws_times, nws_pops)}
     for i, pct in enumerate(s_pops):
         cx = chart_x + int((i + 0.5) * slot_w)
-        py = _py(pct)
-        shade = (74, 124, 188) if i == 0 else (56, 102, 160)
-        edge = RAIN if i == 0 else (126, 170, 228)
-        rect_h = max(1, chart_y + chart_h - py)
-        pygame.draw.rect(screen, shade, (cx - bar_w // 2, py, bar_w, rect_h), border_radius=4)
-        pygame.draw.rect(screen, edge, (cx - bar_w // 2, py, bar_w, rect_h), 1, border_radius=4)
-        lbl_y = max(chart_y + 10, py - 2)
-        draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], (170, 210, 255), cx, lbl_y, anchor="midbottom")
+        om_py = _py(pct)
+        om_h = max(1, chart_y + chart_h - om_py)
+        om_x = cx - bar_w - 2
+        pygame.draw.rect(screen, (56, 102, 160), (om_x, om_py, bar_w, om_h), border_radius=3)
+        pygame.draw.rect(screen, ACCENT, (om_x, om_py, bar_w, om_h), 1, border_radius=3)
+        om_lbl_y = max(chart_y + 10, om_py - 2)
+
+        if s_times[i] in nws_by_time:
+            n_pct = nws_by_time[s_times[i]]
+            nws_py = _py(n_pct)
+            nws_h = max(1, chart_y + chart_h - nws_py)
+            nws_x = cx + 2
+            pygame.draw.rect(screen, (128, 102, 34), (nws_x, nws_py, bar_w, nws_h), border_radius=3)
+            pygame.draw.rect(screen, GOLD, (nws_x, nws_py, bar_w, nws_h), 1, border_radius=3)
+            nws_lbl_y = max(chart_y + 10, nws_py - 2)
+
+            if abs(om_lbl_y - nws_lbl_y) < 12:
+                if om_py <= nws_py:
+                    draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], ACCENT, om_x + bar_w // 2, om_py - 2, anchor="midbottom")
+                    draw_text(screen, f"{int(round(n_pct))}%", fonts["tiny"], GOLD, nws_x + bar_w // 2, nws_py + 6, anchor="midtop")
+                else:
+                    draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], ACCENT, om_x + bar_w // 2, om_py + 6, anchor="midtop")
+                    draw_text(screen, f"{int(round(n_pct))}%", fonts["tiny"], GOLD, nws_x + bar_w // 2, nws_py - 2, anchor="midbottom")
+            else:
+                draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], ACCENT, om_x + bar_w // 2, om_lbl_y, anchor="midbottom")
+                draw_text(screen, f"{int(round(n_pct))}%", fonts["tiny"], GOLD, nws_x + bar_w // 2, nws_lbl_y, anchor="midbottom")
+        else:
+            draw_text(screen, f"{int(round(pct))}%", fonts["tiny"], ACCENT, om_x + bar_w // 2, om_lbl_y, anchor="midbottom")
 
     hour_y = chart_y + chart_h + 2
     for i in range(1, n):
@@ -1737,6 +1878,14 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         h12 = hr % 12 or 12
         draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM,
                   chart_x + int(i * slot_w), hour_y, anchor="midtop")
+
+    legend_x = x + 300
+    legend_y = y + 20
+    legend_gap = 24
+    pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+    draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
+    pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+    draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
 
 
 def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
@@ -1880,12 +2029,18 @@ def draw_screen(screen, state, fonts, tick):
                 draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
 
 
-        # Map box
-        mx, my, mw, mh = 520, 140, 820, 720
+        # Map box centered between left widget column and right 7-day panel.
+        left_col_right = 520
+        right_panel_left = W - 430
+        mw, mh = 820, 720
+        mx = left_col_right + (right_panel_left - left_col_right - mw) // 2
+        my = 160
         draw_map(screen, state, fonts, mx, my, mw, mh)
 
-        # Wind widget — centered below the map
-        draw_wind_widget(screen, state, fonts, mx + mw // 2, my + mh + 60)
+        # Wind widget — center from the actual rendered 768px map surface.
+        map_draw_x = mx + (mw - 768) // 2
+        map_center_x = map_draw_x + 768 // 2
+        draw_wind_widget(screen, state, fonts, map_center_x - 10, my + mh + 6)
 
         # 7-Day Forecast
         for i in range(7):
