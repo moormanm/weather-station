@@ -51,6 +51,7 @@ FEATURES = {
         "HOURLY_PRECIP",
         fallback=config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
     ),
+    "ALT_PREDICTIONS": config.getboolean("FEATURES", "ALT_PREDICTIONS", fallback=False),
     "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
     "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=False),
     "NFLSTATS":        config.getboolean("FEATURES", "NFLSTATS",        fallback=False),
@@ -1677,8 +1678,9 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
 
     hourly = (state.weather or {}).get("hourly", {})
     s_times, s_temps = _hourly_series(hourly, "temperature_2m")
-    nws_hourly = (state.nws_hourly_temp or {}).get("hourly", {})
-    nws_times, nws_temps = _hourly_series(nws_hourly, "temperature_2m")
+    show_alt = FEATURES.get("ALT_PREDICTIONS", False)
+    nws_hourly = (state.nws_hourly_temp or {}).get("hourly", {}) if show_alt else {}
+    nws_times, nws_temps = _hourly_series(nws_hourly, "temperature_2m") if show_alt else ([], [])
 
     if len(s_times) < 2:
         draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
@@ -1729,7 +1731,7 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         pygame.draw.lines(screen, ACCENT, False, om_pts, 2)
 
     nws_idx = {t: v for t, v in zip(nws_times, nws_temps)}
-    if len(nws_times) >= 2:
+    if show_alt and len(nws_times) >= 2:
         nws_pts = [(_cx(i), _ty(nws_idx[t])) for i, t in enumerate(s_times) if t in nws_idx]
         if len(nws_pts) >= 2:
             pygame.draw.lines(screen, GOLD, False, nws_pts, 2)
@@ -1739,11 +1741,11 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
 
         has_nws = s_times[i] in nws_idx
         nws_py = _ty(nws_idx[s_times[i]]) if has_nws else None
-        if has_nws:
+        if show_alt and has_nws:
             pygame.draw.circle(screen, GOLD, (px, nws_py), 4 if i == 0 else 3)
 
         om_lbl = f"{round(s_temps[i])}\u00b0"
-        if has_nws:
+        if show_alt and has_nws:
             nws_lbl = f"{round(nws_idx[s_times[i]])}\u00b0"
             if abs(om_py - nws_py) < 14:
                 if om_py <= nws_py:
@@ -1774,13 +1776,14 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         h12 = hr % 12 or 12
         draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM, _cx(i), hour_y, anchor="midtop")
 
-    legend_x = x + 300
-    legend_y = y + 20
-    legend_gap = 24
-    pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
-    draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
-    pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
-    draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
+    if show_alt:
+        legend_x = x + 300
+        legend_y = y + 20
+        legend_gap = 24
+        pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+        draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
+        pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+        draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
 
 
 def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
@@ -1798,8 +1801,9 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
 
     hourly = (state.weather or {}).get("hourly", {})
     s_times, s_pops = _hourly_series(hourly, "precipitation_probability")
-    nws_hourly = (state.nws_hourly_precip or {}).get("hourly", {})
-    nws_times, nws_pops = _hourly_series(nws_hourly, "precipitation_probability")
+    show_alt = FEATURES.get("ALT_PREDICTIONS", False)
+    nws_hourly = (state.nws_hourly_precip or {}).get("hourly", {}) if show_alt else {}
+    nws_times, nws_pops = _hourly_series(nws_hourly, "precipitation_probability") if show_alt else ([], [])
 
     if len(s_times) < 2:
         draw_text(screen, "Loading...", fonts["small"], TEXT_DIM,
@@ -1879,13 +1883,14 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         draw_text(screen, f"{h12}{ampm}", fonts["tiny"], TEXT_DIM,
                   chart_x + int(i * slot_w), hour_y, anchor="midtop")
 
-    legend_x = x + 300
-    legend_y = y + 20
-    legend_gap = 24
-    pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
-    draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
-    pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
-    draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
+    if show_alt:
+        legend_x = x + 300
+        legend_y = y + 20
+        legend_gap = 24
+        pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+        draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
+        pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+        draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
 
 
 def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
