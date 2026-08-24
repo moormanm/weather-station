@@ -2001,12 +2001,11 @@ def draw_screen(screen, state, fonts, tick):
         runtime_error_source = state.runtime_error_source
         runtime_error_message = state.runtime_error_message
         now_local = datetime.now().astimezone()
+        draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         date_display = now_local.strftime("%A, %B %-d, %Y")
         tz_abbrev = now_local.tzname() or "UNKNOWN"
-        time_display = f"{now_local.strftime('%-I:%M %p')} ({tz_abbrev})"
         draw_text(screen, date_display, fonts["small"], TEXT_DIM, W // 2, 52, anchor="midtop")
-        draw_text(screen, time_display, fonts["small"], TEXT_DIM, W - 60, 52, anchor="topright")
 
         cur = (state.weather or {}).get("current")
         obs_temp_f = state.obs_temp_f
