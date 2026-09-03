@@ -90,6 +90,20 @@ HEADERS = {"User-Agent": USER_AGENT}
 
 _NWS_ENDPOINTS_TTL = 3600
 _NWS_ENDPOINTS_LOCK = threading.Lock()
+
+# How long a fetched payload stays fresh before we revalidate it.  The screen
+# refreshes every 60s, but these upstreams change far more slowly: NWS gridpoint
+# forecasts are regenerated roughly hourly and station observations arrive about
+# every 20 minutes, so a 60s poll re-downloaded identical bytes ~50x over.
+_TTL_OPEN_METEO   = 60
+_TTL_NWS_FORECAST = 60
+_TTL_NWS_HOURLY   = 300
+_TTL_NWS_OBS      = 60
+_TTL_NWS_OBS_LIST = 60
+
+_HTTP_CACHE = {}
+_HTTP_CACHE_LOCK = threading.Lock()
+
 _NWS_ENDPOINTS_CACHE = {
     "forecast": None,
     "observations": None,
@@ -304,6 +318,88 @@ def safe_fetch(url, timeout=15, headers=None, retries=0, retry_delay=1.5):
     return None
 
 
+def _cached_fetch(url, ttl, timeout=15, retries=2, retry_delay=1.5, headers=None):
+    """safe_fetch() plus a TTL cache and conditional revalidation.
+
+    Inside the TTL the cached body is returned with no network call at all.
+    Once it lapses we revalidate with If-None-Match/If-Modified-Since, so an
+    unchanged resource costs a small 304 instead of a full payload.  If the
+    network call fails outright we fall back to the stale body rather than
+    dropping a widget back to "Loading...".
+    """
+    now = time.time()
+    with _HTTP_CACHE_LOCK:
+        entry = _HTTP_CACHE.get(url)
+        if entry and now < entry["expires_at"]:
+            return entry["body"]
+
+    req_headers = dict(headers or HEADERS)
+    if entry:
+        if entry.get("etag"):
+            req_headers["If-None-Match"] = entry["etag"]
+        if entry.get("last_modified"):
+            req_headers["If-Modified-Since"] = entry["last_modified"]
+
+    attempts = max(1, int(retries) + 1)
+    for attempt in range(1, attempts + 1):
+        try:
+            req = urllib.request.Request(url, headers=req_headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = r.read()
+                etag = r.headers.get("ETag")
+                last_modified = r.headers.get("Last-Modified")
+            with _HTTP_CACHE_LOCK:
+                _HTTP_CACHE[url] = {
+                    "body": body,
+                    "etag": etag,
+                    "last_modified": last_modified,
+                    "expires_at": time.time() + ttl,
+                }
+            return body
+        except urllib.error.HTTPError as e:
+            if e.code == 304 and entry:
+                with _HTTP_CACHE_LOCK:
+                    entry["expires_at"] = time.time() + ttl
+                    _HTTP_CACHE[url] = entry
+                return entry["body"]
+            if e.code == 429:
+                print("!!! Rate limited (429). Cooling down.")
+                return "RATE_LIMITED"
+            print(f"Fetch error for {url}: {e}")
+            break
+        except Exception as e:
+            if attempt < attempts and _is_timeout_like_error(e):
+                delay = retry_delay * attempt
+                print(f"Fetch timeout for {url} (attempt {attempt}/{attempts}), retrying in {delay:.1f}s")
+                time.sleep(delay)
+                continue
+            print(f"Fetch error for {url}: {e}")
+            break
+
+    if entry:
+        print(f"Serving stale cached response for {url}")
+        return entry["body"]
+    return None
+
+
+def _json_or_raise(raw, label):
+    """json.loads() that reports the responding endpoint and the start of the body.
+
+    Upstream services intermittently answer HTTP 200 with a non-JSON payload
+    (captive-portal/CDN HTML, a whitespace-only body, a truncated response).  A
+    bare decode failure only says 'char 0', which hides which endpoint misbehaved
+    and what it actually sent, so attach both to the raised error.
+    """
+    text = raw.decode(errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    try:
+        return json.loads(text)
+    except Exception as e:
+        preview = text[:100]
+        raise ValueError(
+            f"{label} returned non-JSON ({e}); {len(text)} bytes, first 100 chars: {preview!r}"
+        ) from e
+
+
 def _resolve_nws_endpoints():
     """Resolve NWS forecast + observations URLs + timezone for configured LAT/LON."""
     now = time.time()
@@ -325,7 +421,7 @@ def _resolve_nws_endpoints():
     if not raw or raw == "RATE_LIMITED":
         raise RuntimeError("Failed to resolve NWS points data for configured coordinates")
 
-    props = json.loads(raw.decode()).get("properties", {})
+    props = _json_or_raise(raw, f"NWS points ({points_url})").get("properties", {})
     forecast_url = props.get("forecast")
     timezone = props.get("timeZone")
     stations_url = props.get("observationStations")
@@ -336,7 +432,7 @@ def _resolve_nws_endpoints():
     if not stations_raw or stations_raw == "RATE_LIMITED":
         raise RuntimeError("Failed to resolve NWS observation station list")
 
-    stations_data = json.loads(stations_raw.decode())
+    stations_data = _json_or_raise(stations_raw, f"NWS observation stations ({stations_url})")
     features = stations_data.get("features") or []
     if not features:
         raise RuntimeError("NWS observation station list is empty")
@@ -373,9 +469,9 @@ def _fetch_nws_hilo(forecast_url, stations_url):
     current_obs_temp_f = None
     try:
         # NWS 7-day forecast for days 1+
-        raw = safe_fetch(forecast_url, timeout=15, retries=2)
+        raw = _cached_fetch(forecast_url, _TTL_NWS_FORECAST, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
-            periods = json.loads(raw.decode())["properties"]["periods"]
+            periods = _json_or_raise(raw, f"NWS forecast ({forecast_url})")["properties"]["periods"]
             hi_by_date = {}
             lo_by_date = {}
             for p in periods:
@@ -398,9 +494,9 @@ def _fetch_nws_hilo(forecast_url, stations_url):
         # Current observed temp from nearest NWS station.
         # Use /latest to avoid stale ordering/caching issues in the /observations list.
         latest_url = stations_url.split("?", 1)[0].rstrip("/") + "/latest?require_qc=true"
-        latest_raw = safe_fetch(latest_url, timeout=15, retries=2)
+        latest_raw = _cached_fetch(latest_url, _TTL_NWS_OBS, timeout=15, retries=2)
         if latest_raw and latest_raw != "RATE_LIMITED":
-            latest_props = json.loads(latest_raw.decode()).get("properties", {})
+            latest_props = _json_or_raise(latest_raw, f"NWS latest observation ({latest_url})").get("properties", {})
             t_obj = latest_props.get("temperature") or {}
             t_c = t_obj.get("value")
             if t_c is not None:
@@ -410,9 +506,9 @@ def _fetch_nws_hilo(forecast_url, stations_url):
 
     try:
         # Today's observed high from nearest NWS observation station
-        raw = safe_fetch(stations_url, timeout=15, retries=2)
+        raw = _cached_fetch(stations_url, _TTL_NWS_OBS_LIST, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
-            obs = json.loads(raw.decode())["features"]
+            obs = _json_or_raise(raw, f"NWS station observations ({stations_url})")["features"]
             today = datetime.now().strftime("%Y-%m-%d")
             today_temps = []
             newest_ts = None
@@ -452,51 +548,53 @@ def _fetch_nws_hilo(forecast_url, stations_url):
     return hilo, current_obs_temp_f
 
 
-def _fetch_nws_hourly_pop(forecast_url):
-    """Return ({hourly: {time: [], precipitation_probability: []}}, source_label) from NWS hourly."""
-    hourly_url = forecast_url.rstrip("/") + "/hourly"
-    raw = safe_fetch(hourly_url, timeout=15, retries=2)
-    if not raw or raw == "RATE_LIMITED":
-        return {"hourly": {"time": [], "precipitation_probability": []}}, "NWS"
+def _fetch_nws_hourly(forecast_url):
+    """Fetch the NWS hourly forecast once and derive both series from it.
 
-    periods = json.loads(raw.decode()).get("properties", {}).get("periods", [])
-    times, pops = [], []
+    The temperature and precipitation charts read the same endpoint, so fetching
+    it separately for each doubled the NWS request rate and let the two charts
+    render data from two different responses.
+
+    Returns ((pop_dict, temp_dict), source_label).
+    """
+    empty_pop = {"hourly": {"time": [], "precipitation_probability": []}}
+    empty_temp = {"hourly": {"time": [], "temperature_2m": []}}
+
+    hourly_url = forecast_url.rstrip("/") + "/hourly"
+    raw = _cached_fetch(hourly_url, _TTL_NWS_HOURLY, timeout=15, retries=2)
+    if not raw or raw == "RATE_LIMITED":
+        return (empty_pop, empty_temp), "NWS"
+
+    periods = _json_or_raise(raw, f"NWS hourly ({hourly_url})").get("properties", {}).get("periods", [])
+    pop_times, pops = [], []
+    temp_times, temps = [], []
     for p in periods[:48]:
         start = p.get("startTime")
-        pop_obj = p.get("probabilityOfPrecipitation") or {}
-        pop_val = pop_obj.get("value")
         if not start:
             continue
         try:
             dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            times.append(dt.strftime("%Y-%m-%dT%H:00"))
         except Exception:
             continue
+        stamp = dt.strftime("%Y-%m-%dT%H:00")
+
+        pop_obj = p.get("probabilityOfPrecipitation") or {}
+        pop_val = pop_obj.get("value")
+        pop_times.append(stamp)
         pops.append(0 if pop_val is None else max(0, min(100, int(round(float(pop_val))))))
-    return {"hourly": {"time": times, "precipitation_probability": pops}}, "NWS"
 
-
-def _fetch_nws_hourly_temp(forecast_url):
-    """Return ({hourly: {time: [], temperature_2m: []}}, source_label) from NWS hourly."""
-    hourly_url = forecast_url.rstrip("/") + "/hourly"
-    raw = safe_fetch(hourly_url, timeout=15, retries=2)
-    if not raw or raw == "RATE_LIMITED":
-        return {"hourly": {"time": [], "temperature_2m": []}}, "NWS"
-
-    periods = json.loads(raw.decode()).get("properties", {}).get("periods", [])
-    times, temps = [], []
-    for p in periods[:48]:
-        start = p.get("startTime")
         temp_f = p.get("temperature")
-        if not start or temp_f is None:
-            continue
-        try:
-            dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            times.append(dt.strftime("%Y-%m-%dT%H:00"))
-            temps.append(float(temp_f))
-        except Exception:
-            continue
-    return {"hourly": {"time": times, "temperature_2m": temps}}, "NWS"
+        if temp_f is not None:
+            try:
+                temps.append(float(temp_f))
+                temp_times.append(stamp)
+            except (TypeError, ValueError):
+                pass
+
+    return (
+        {"hourly": {"time": pop_times, "precipitation_probability": pops}},
+        {"hourly": {"time": temp_times, "temperature_2m": temps}},
+    ), "NWS"
 
 
 def _load_ram_history():
@@ -634,7 +732,7 @@ class AppState:
                f"&hourly=temperature_2m,relative_humidity_2m,precipitation_probability"
                f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
                f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7")
-        raw = safe_fetch(url, timeout=20, retries=3, retry_delay=2.0)
+        raw = _cached_fetch(url, _TTL_OPEN_METEO, timeout=20, retries=3, retry_delay=2.0)
         if raw == "RATE_LIMITED":
             self.backoff_until = time.time() + 1800
             self.set_runtime_error("WEATHER", "Open-Meteo rate limited; retrying in 30 minutes")
@@ -642,25 +740,46 @@ class AppState:
             return
         if raw:
             try:
-                data = json.loads(raw.decode())
-                nws_hilo, obs_temp_f = _fetch_nws_hilo(forecast_url, stations_url)
-                nws_hourly_precip, nws_hourly_source = _fetch_nws_hourly_pop(forecast_url)
-                nws_hourly_temp, nws_hourly_temp_source = _fetch_nws_hourly_temp(forecast_url)
-                with self.lock:
-                    self.weather = data
-                    self.nws_hilo = nws_hilo
-                    self.obs_temp_f = obs_temp_f
-                    self.nws_hourly_precip = nws_hourly_precip
-                    self.nws_hourly_source = nws_hourly_source
-                    self.nws_hourly_temp = nws_hourly_temp
-                    self.nws_hourly_temp_source = nws_hourly_temp_source
-                    self.weather_loaded_once = True
-                    self.last_weather_upd = time.time()
-                self.clear_runtime_error("WEATHER")
+                data = _json_or_raise(raw, "Open-Meteo forecast")
             except Exception as e:
                 print(f"Weather parse error: {e}")
                 self.set_runtime_error("WEATHER", f"Weather parse failed: {e}")
                 self.last_weather_upd = time.time()
+                return
+
+            nws_error = None
+            nws_hilo, obs_temp_f = None, None
+            nws_hourly = None
+            try:
+                nws_hilo, obs_temp_f = _fetch_nws_hilo(forecast_url, stations_url)
+                # These two series only feed the ALT_PREDICTIONS overlay, so
+                # there is nothing to fetch when that overlay is turned off.
+                if FEATURES.get("ALT_PREDICTIONS", False):
+                    nws_hourly, _ = _fetch_nws_hourly(forecast_url)
+            except Exception as e:
+                nws_error = e
+                print(f"NWS supplemental data unavailable: {e}")
+
+            # Open-Meteo is the primary source and it parsed fine, so publish it
+            # even when the NWS extras failed; a transient NWS blip used to throw
+            # this away and leave the whole dashboard on "Loading...".
+            with self.lock:
+                self.weather = data
+                if nws_hilo is not None:
+                    self.nws_hilo = nws_hilo
+                if obs_temp_f is not None:
+                    self.obs_temp_f = obs_temp_f
+                if nws_hourly is not None:
+                    self.nws_hourly_precip, self.nws_hourly_temp = nws_hourly
+                    self.nws_hourly_source = "NWS"
+                    self.nws_hourly_temp_source = "NWS"
+                self.weather_loaded_once = True
+                self.last_weather_upd = time.time()
+
+            if nws_error is None:
+                self.clear_runtime_error("WEATHER")
+            else:
+                self.set_runtime_error("WEATHER", f"NWS data unavailable: {nws_error}")
         else:
             self.set_runtime_error("WEATHER", "Open-Meteo weather fetch failed")
             self.last_weather_upd = time.time()
