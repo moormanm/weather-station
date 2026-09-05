@@ -2255,28 +2255,16 @@ def main():
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
     pygame.mouse.set_visible(False)
 
-    # Avoid pygame.font.SysFont here: it runs fc-list, which can time out on
-    # Raspberry Pi OS and leave the dashboard using an unexpected fallback.
-    regular_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-    bold_font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-    if os.path.isfile(regular_font_path) and os.path.isfile(bold_font_path):
-        fonts = {
-            "huge":   pygame.font.Font(bold_font_path, 160),
-            "large":  pygame.font.Font(bold_font_path, 65),
-            "medium": pygame.font.Font(regular_font_path, 40),
-            "small":  pygame.font.Font(regular_font_path, 30),
-            "tiny":   pygame.font.Font(regular_font_path, 20),
-        }
-    else:
-        # Preserve the original behavior on systems without fonts-dejavu.
-        f_p = "dejavusans"
-        fonts = {
-            "huge":   pygame.font.SysFont(f_p, 160, True),
-            "large":  pygame.font.SysFont(f_p, 65, True),
-            "medium": pygame.font.SysFont(f_p, 40),
-            "small":  pygame.font.SysFont(f_p, 30),
-            "tiny":   pygame.font.SysFont(f_p, 20),
-        }
+    asset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+    regular_font_path = os.path.join(asset_dir, "LiberationSans-Regular.ttf")
+    bold_font_path = os.path.join(asset_dir, "LiberationSans-Bold.ttf")
+    fonts = {
+        "huge":   pygame.font.Font(bold_font_path, 160),
+        "large":  pygame.font.Font(bold_font_path, 65),
+        "medium": pygame.font.Font(regular_font_path, 40),
+        "small":  pygame.font.Font(regular_font_path, 30),
+        "tiny":   pygame.font.Font(regular_font_path, 20),
+    }
 
     state = AppState()
     repo_dir = os.path.dirname(os.path.abspath(__file__))
