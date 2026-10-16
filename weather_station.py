@@ -1037,6 +1037,7 @@ class AppState:
                     "lat": lat,
                     "lon": lon,
                     "speed": speed,
+                    "bearing": bearing % 360,
                     "heading": headings[int((bearing % 360) / 45 + 0.5) % 8],
                     "color": (31, 111, 229) if railroad == "AMTRAK" else (226, 75, 75),
                     "origin": station_by_code.get(
@@ -1608,11 +1609,6 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
         pygame.draw.circle(tile_surf, (95, 112, 132), (station_x, station_y), 4)
         pygame.draw.circle(tile_surf, TEXT_BRIGHT, (station_x, station_y), 4, 1)
 
-    heading_vectors = {
-        "N": (0, -1), "NE": (0.707, -0.707), "E": (1, 0),
-        "SE": (0.707, 0.707), "S": (0, 1), "SW": (-0.707, 0.707),
-        "W": (-1, 0), "NW": (-0.707, -0.707),
-    }
     for train in state.train_positions:
         train_xw, train_yw = _world_px(train["lat"], train["lon"], zoom)
         train_x = int(round(map_cx + train_xw - map_world_x))
@@ -1621,15 +1617,25 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
             continue
         color = train["color"]
         radius = 17 if len(train["number"]) >= 3 else 14
+        angle = math.radians(train["bearing"])
+        direction_x, direction_y = math.sin(angle), -math.cos(angle)
+        perp_x, perp_y = -direction_y, direction_x
+        tip_len, head_len, head_half = radius + 18, 18, 7
+        tip = (train_x + direction_x * tip_len, train_y + direction_y * tip_len)
+        base = (tip[0] - direction_x * head_len, tip[1] - direction_y * head_len)
+        head = [
+            tip,
+            (base[0] + perp_x * head_half, base[1] + perp_y * head_half),
+            (base[0] - perp_x * head_half, base[1] - perp_y * head_half),
+        ]
+        pygame.draw.line(tile_surf, (12, 16, 22), (train_x, train_y), base, 7)
+        pygame.draw.polygon(tile_surf, (12, 16, 22), head)
+        pygame.draw.polygon(tile_surf, (12, 16, 22), head, 4)
+        pygame.draw.line(tile_surf, (255, 220, 60), (train_x, train_y), base, 3)
+        pygame.draw.polygon(tile_surf, (255, 220, 60), head)
         pygame.draw.circle(tile_surf, (12, 16, 22), (train_x, train_y), radius + 2)
         pygame.draw.circle(tile_surf, color, (train_x, train_y), radius)
         pygame.draw.circle(tile_surf, TEXT_BRIGHT, (train_x, train_y), radius, 2)
-        direction_x, direction_y = heading_vectors[train["heading"]]
-        pygame.draw.line(
-            tile_surf, TEXT_BRIGHT,
-            (int(train_x + direction_x * 8), int(train_y + direction_y * 8)),
-            (int(train_x + direction_x * 23), int(train_y + direction_y * 23)), 3,
-        )
         number = fonts["compact_bold"].render(train["number"], True, TEXT_BRIGHT)
         tile_surf.blit(number, number.get_rect(center=(train_x, train_y)))
 
