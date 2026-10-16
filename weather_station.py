@@ -61,9 +61,32 @@ NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_sectio
 
 SCREEN_W, SCREEN_H = 1920, 1080
 
-MAP_ZOOM = 7  # zoom level for both basemap and radar tiles (RainViewer max = 7)
+MAP_ZOOM = 9
+RADAR_ZOOM = 7  # RainViewer tiles are available up to zoom 7
+MAP_SURFACE_W, MAP_SURFACE_H = 900, 780
+WIND_WIDGET_RADIUS = 32
+TRAIN_UPDATE_INTERVAL_S = 30
 SELF_UPDATE_INTERVAL_S = config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=6 * 3600)
 SELF_UPDATE_TIMEOUT_S = 120
+
+TRAIN_FACTS = [
+    "The Baltimore & Ohio Railroad opened in 1830 as the first US common-carrier railroad.",
+    "A standard freight train can be more than two miles long.",
+    "The term 'deadline' has roots in railroad scheduling.",
+    "Positive Train Control can automatically slow or stop trains to help prevent collisions.",
+    "The Golden Spike ceremony linked the US transcontinental railroad in 1869.",
+    "Freight trains use dynamic braking, where traction motors help slow the train.",
+    "The caboose was once standard on freight trains, but most railroads phased it out by the 1990s.",
+    "The first American locomotive, Tom Thumb, raced a horse in 1830.",
+    "Train wheels have a slight taper that helps keep them centered on the rails.",
+    "The Northeast Corridor lets some Acela trains reach 150 mph.",
+    "A unit train carries one main type of cargo, such as coal, grain, or cars.",
+    "The Strasburg Rail Road in Pennsylvania has operated since 1832.",
+    "Railroad ties support the rails and help keep the track at the correct gauge.",
+    "Hot box detectors check passing trains for overheated wheel bearings.",
+    "A locomotive's tractive effort is the pulling force it can apply to a train.",
+    "Intermodal containers can move by ship, rail, and truck without unpacking their cargo.",
+]
 
 def _loc_pixel_offset(lat, lon, zoom):
     """Sub-tile pixel offset of exact location from center of its tile at given zoom."""
@@ -82,6 +105,63 @@ def _tile_xy(lat, lon, zoom):
     x = int((lon + 180.0) / 360.0 * n)
     y = int((1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * n)
     return x, y
+
+
+def _world_px(lat, lon, zoom):
+    """Return Web-Mercator world-pixel coordinates for a location."""
+    n = 2 ** zoom
+    lat_rad = math.radians(lat)
+    return (
+        (lon + 180.0) / 360.0 * n * 256,
+        (1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n * 256,
+    )
+
+
+def _map_tile_offsets(zoom):
+    world_x, world_y = _world_px(MAP_LAT, MAP_LONG, zoom)
+    center_x, center_y = _tile_xy(MAP_LAT, MAP_LONG, zoom)
+    x_min = math.floor((world_x - MAP_SURFACE_W / 2) / 256)
+    x_max = math.floor((world_x + MAP_SURFACE_W / 2 - 1) / 256)
+    y_min = math.floor((world_y - MAP_SURFACE_H / 2) / 256)
+    y_max = math.floor((world_y + MAP_SURFACE_H / 2 - 1) / 256)
+    return [
+        (x - center_x, y - center_y)
+        for y in range(y_min, y_max + 1)
+        for x in range(x_min, x_max + 1)
+    ]
+
+
+def _distance_miles(first, second):
+    lat1, lon1 = first
+    lat2, lon2 = second
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return 3958.8 * 2 * math.asin(math.sqrt(a))
+
+
+def _fetch_transitdocs_json(path):
+    headers = {
+        "User-Agent": "FrederickWeatherStation/2.0 (weather and train dashboard)",
+        "Accept": "application/json",
+    }
+    last_error = None
+    for base in ("https://asm.transitdocs.com", "https://asm-backend.transitdocs.com"):
+        url = f"{base}/{path}"
+        raw = safe_fetch(url, timeout=20, headers=headers, retries=1)
+        if not raw or raw == "RATE_LIMITED":
+            last_error = RuntimeError(f"TransitDocs request failed: {url}")
+            continue
+        try:
+            return _json_or_raise(raw, f"TransitDocs {path} ({url})")
+        except ValueError as e:
+            last_error = e
+    raise RuntimeError(f"TransitDocs {path} unavailable: {last_error}")
+
 
 LOC_DOT_OFFSET = (0,0)  # computed dynamically
 
@@ -649,6 +729,16 @@ class AppState:
         self.map_tiles = {}
         self.map_label_tiles = {}
         self.radar_tiles = {}
+        self.train_positions = []
+        self.train_stations = []
+        self.train_tracks = []
+        self.last_train_upd = 0
+        self.train_data_loaded = False
+        self.train_error = None
+        self._map_render_key = None
+        self._map_render_surface = None
+        self._radar_render_key = None
+        self._radar_render_surface = None
         self.last_weather_upd = 0
         self.last_map_upd = 0
         self.last_ram_upd = 0
@@ -687,6 +777,7 @@ class AppState:
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
+        self._train_running = False
         self._ram_running = False
         self.runtime_error_source = None
         self.runtime_error_message = None
@@ -795,73 +886,74 @@ class AppState:
             self._map_running = False
 
     def _do_update_map(self):
-        zoom = MAP_ZOOM  # 7
+        zoom = MAP_ZOOM
         lat_rad = math.radians(MAP_LAT)
         n = 2 ** zoom
         xt = int((MAP_LONG + 180.0) / 360.0 * n)
         yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
 
-        # 3×3 basemap tiles at zoom 7
+        tile_offsets = _map_tile_offsets(zoom)
         new_tiles = {}
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                # ArcGIS World Imagery (Esri), using the standard XYZ tile scheme.
-                url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{yt+dy}/{xt+dx}"
-                fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
-                if os.path.exists(fname):
-                    with open(fname, "rb") as f:
-                        data = f.read()
-                else:
-                    data = safe_fetch(url, timeout=5)
-                    if data and data != "RATE_LIMITED" and len(data) > 2000:
-                        with open(fname, "wb") as f:
-                            f.write(data)
-                if data and data != "RATE_LIMITED":
-                    new_tiles[(dx, dy)] = data
+        for dx, dy in tile_offsets:
+            # ArcGIS World Imagery (Esri), using the standard XYZ tile scheme.
+            url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{yt+dy}/{xt+dx}"
+            fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
+            if os.path.exists(fname):
+                with open(fname, "rb") as f:
+                    data = f.read()
+            else:
+                data = safe_fetch(url, timeout=5)
+                if data and data != "RATE_LIMITED" and len(data) > 2000:
+                    with open(fname, "wb") as f:
+                        f.write(data)
+            if data and data != "RATE_LIMITED":
+                new_tiles[(dx, dy)] = data
 
         # ArcGIS place-name/reference overlay. World Imagery intentionally has
         # no city labels, so draw Esri's transparent reference layer over it.
         # This supplies city/town names while leaving the aerial imagery visible.
         new_label_tiles = {}
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
-                label_url = (
-                    f"https://server.arcgisonline.com/ArcGIS/rest/services/"
-                    f"Reference/World_Boundaries_and_Places/MapServer/tile/"
-                    f"{zoom}/{yt+dy}/{xt+dx}"
-                )
-                label_fname = os.path.join(
-                    TILE_CACHE_DIR, hashlib.md5(label_url.encode()).hexdigest() + ".png"
-                )
-                label_data = None
-                if os.path.exists(label_fname):
+        for dx, dy in tile_offsets:
+            label_url = (
+                f"https://server.arcgisonline.com/ArcGIS/rest/services/"
+                f"Reference/World_Boundaries_and_Places/MapServer/tile/"
+                f"{zoom}/{yt+dy}/{xt+dx}"
+            )
+            label_fname = os.path.join(
+                TILE_CACHE_DIR, hashlib.md5(label_url.encode()).hexdigest() + ".png"
+            )
+            label_data = None
+            if os.path.exists(label_fname):
+                try:
+                    with open(label_fname, "rb") as f:
+                        label_data = f.read()
+                except Exception:
+                    label_data = None
+            if not label_data:
+                label_data = safe_fetch(label_url, timeout=5)
+                if label_data and label_data != "RATE_LIMITED" and len(label_data) > 100:
                     try:
-                        with open(label_fname, "rb") as f:
-                            label_data = f.read()
+                        with open(label_fname, "wb") as f:
+                            f.write(label_data)
                     except Exception:
-                        label_data = None
-                if not label_data:
-                    label_data = safe_fetch(label_url, timeout=5)
-                    if label_data and label_data != "RATE_LIMITED" and len(label_data) > 100:
-                        try:
-                            with open(label_fname, "wb") as f:
-                                f.write(label_data)
-                        except Exception:
-                            pass
-                if label_data and label_data != "RATE_LIMITED":
-                    new_label_tiles[(dx, dy)] = label_data
+                        pass
+            if label_data and label_data != "RATE_LIMITED":
+                new_label_tiles[(dx, dy)] = label_data
 
-        # Radar — fetch same 3×3 grid of zoom-7 tiles as basemap so all nearby
-        # precipitation is visible, not just what falls on the single center tile.
+        # RainViewer stops at zoom 7, so render those tiles over the closer map.
         new_radar_tiles = {}
         meta = safe_fetch("https://api.rainviewer.com/public/weather-maps.json")
         if meta and meta != "RATE_LIMITED":
             try:
                 rv = json.loads(meta.decode())
                 path, host = rv["radar"]["past"][-1]["path"], rv["host"]
+                radar_xt, radar_yt = _tile_xy(MAP_LAT, MAP_LONG, RADAR_ZOOM)
                 for dy in range(-1, 2):
                     for dx in range(-1, 2):
-                        radar_url = f"{host}{path}/256/{zoom}/{xt+dx}/{yt+dy}/6/1_1.png"
+                        radar_url = (
+                            f"{host}{path}/256/{RADAR_ZOOM}/"
+                            f"{radar_xt+dx}/{radar_yt+dy}/6/1_1.png"
+                        )
                         raw = safe_fetch(radar_url, timeout=10)
                         if raw and raw != "RATE_LIMITED":
                             if raw[:4] == b'\x89PNG':
@@ -877,6 +969,136 @@ class AppState:
             self.map_label_tiles = new_label_tiles
             self.radar_tiles = new_radar_tiles
             self.last_map_upd = time.time()
+
+    # ── Live trains ───────────────────────────────────────────────────────────
+    def update_trains(self):
+        if self._train_running:
+            return
+        self._train_running = True
+        try:
+            map_data = _fetch_transitdocs_json("map")
+            station_data = _fetch_transitdocs_json("stationInfo")
+            if not isinstance(map_data, list) or not isinstance(station_data, list):
+                raise ValueError("TransitDocs returned an unexpected data format")
+
+            stations = []
+            station_by_code = {}
+            for raw in station_data:
+                code = str(raw.get("code") or "").strip().upper()
+                try:
+                    lat = float(raw["latitude"])
+                    lon = float(raw["longitude"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not code:
+                    continue
+                city = str(raw.get("city") or "").strip()
+                region = str(raw.get("state") or "").strip()
+                station = {
+                    "code": code,
+                    "name": city if not region else f"{city}, {region}",
+                    "lat": lat,
+                    "lon": lon,
+                    "show_on_map": bool(raw.get("show_on_map", True)),
+                }
+                station["name"] = station["name"] or code
+                stations.append(station)
+                station_by_code[code] = station
+
+            trains = []
+            tracks = []
+            seen_segments = set()
+            headings = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+            map_center_x, map_center_y = _world_px(MAP_LAT, MAP_LONG, MAP_ZOOM)
+
+            def in_map(lat, lon):
+                point_x, point_y = _world_px(lat, lon, MAP_ZOOM)
+                return (
+                    abs(point_x - map_center_x) <= MAP_SURFACE_W / 2 + 256
+                    and abs(point_y - map_center_y) <= MAP_SURFACE_H / 2 + 256
+                )
+
+            for raw in map_data:
+                location = raw.get("location") or {}
+                try:
+                    lat = float(location["latitude"])
+                    lon = float(location["longitude"])
+                    speed = max(0.0, float(location.get("speed") or 0.0))
+                    bearing = float(location.get("heading") or 0.0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+
+                railroad = str(raw.get("railroad") or "").upper()
+                train_number = str(raw.get("number") or "?")
+                stops = raw.get("stops") or []
+                train = {
+                    "number": train_number,
+                    "name": str(raw.get("name") or f"{railroad} {train_number}").strip(),
+                    "lat": lat,
+                    "lon": lon,
+                    "speed": speed,
+                    "heading": headings[int((bearing % 360) / 45 + 0.5) % 8],
+                    "color": (31, 111, 229) if railroad == "AMTRAK" else (226, 75, 75),
+                    "origin": station_by_code.get(
+                        str(raw.get("origin") or "").strip().upper(), {}
+                    ).get("name", str(raw.get("origin") or "—")),
+                    "destination": station_by_code.get(
+                        str(raw.get("destination") or "").strip().upper(), {}
+                    ).get("name", str(raw.get("destination") or "—")),
+                }
+                next_stop = None
+                for stop in stops:
+                    if stop.get("canceled"):
+                        continue
+                    code = str(stop.get("code") or "").strip().upper()
+                    station = station_by_code.get(code)
+                    if not station or code == str(raw.get("origin") or "").upper():
+                        continue
+                    stop_time = stop.get("sched_arrive") or stop.get("sched_depart")
+                    try:
+                        is_upcoming = float(stop_time) >= time.time() - 120
+                    except (TypeError, ValueError):
+                        is_upcoming = next_stop is None
+                    if is_upcoming:
+                        next_stop = station["name"]
+                        break
+                train["next_stop"] = next_stop or train["destination"]
+                trains.append(train)
+
+                route = []
+                for stop in stops:
+                    station = station_by_code.get(
+                        str(stop.get("code") or "").strip().upper()
+                    )
+                    if station:
+                        route.append((station["lat"], station["lon"]))
+                for first, second in zip(route, route[1:]):
+                    if _distance_miles(first, second) > 450:
+                        continue
+                    if not (in_map(*first) or in_map(*second)):
+                        continue
+                    key = tuple(sorted((
+                        (round(first[0], 4), round(first[1], 4)),
+                        (round(second[0], 4), round(second[1], 4)),
+                    )))
+                    if key not in seen_segments:
+                        seen_segments.add(key)
+                        tracks.append((first, second))
+
+            stations = [station for station in stations if in_map(station["lat"], station["lon"])]
+            with self.lock:
+                self.train_positions = trains
+                self.train_stations = stations
+                self.train_tracks = tracks
+                self.last_train_upd = time.time()
+                self.train_data_loaded = True
+                self.train_error = None
+        except Exception as e:
+            print(f"Train data update error: {e}")
+            with self.lock:
+                self.train_error = str(e)
+        finally:
+            self._train_running = False
 
     # ── RAM Price ─────────────────────────────────────────────────────────────
     def update_ram(self):
@@ -936,11 +1158,7 @@ class AppState:
         self._quotes_running = True
         try:
             import random
-            pool = _fetch_quote_pool()
-            if not pool:
-                with self.lock:
-                    self.motd_last_cycle = time.time()  # start retry clock even on failure
-                return
+            pool = _fetch_quote_pool() + TRAIN_FACTS[:]
             random.shuffle(pool)
             start = random.randrange(len(pool))
             with self.lock:
@@ -1292,79 +1510,141 @@ def _maybe_self_update_and_restart(repo_dir):
 
 
 def draw_map(screen, state, fonts, mx, my, mw, mh):
-    """Draw the map centered on MAP_LAT/MAP_LONG and the weather marker at LATITUDE/LONGITUDE."""
+    """Draw weather radar and live train data over a shared map."""
     if not state.map_tiles:
         return
 
     TILE = 256.0
     zoom = MAP_ZOOM
-    n = 2 ** zoom
 
-    # MAP_LAT/MAP_LONG define the exact geographic point at the center
-    # of the displayed map.  They are used only by the map renderer.
-    map_lat_rad = math.radians(MAP_LAT)
-    map_world_x = (MAP_LONG + 180.0) / 360.0 * n * TILE
-    map_world_y = (1.0 - math.log(
-        math.tan(map_lat_rad) + 1 / math.cos(map_lat_rad)
-    ) / math.pi) / 2.0 * n * TILE
+    map_world_x, map_world_y = _world_px(MAP_LAT, MAP_LONG, zoom)
 
-    # The downloaded 3x3 grid is indexed relative to the tile containing
-    # MAP_LAT/MAP_LONG.  Shift every tile by the fractional position of the
-    # exact map center so that MAP_LAT/MAP_LONG is precisely at (384,384).
-    center_xt = int(map_world_x // TILE)
-    center_yt = int(map_world_y // TILE)
+    center_xt, center_yt = _tile_xy(MAP_LAT, MAP_LONG, zoom)
 
-    tile_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
-    tile_ox = (mw - 768) // 2
-    tile_oy = (mh - 768) // 2
+    map_cx, map_cy = MAP_SURFACE_W / 2, MAP_SURFACE_H / 2
 
     def tile_position(dx, dy):
         tx = center_xt + dx
         ty = center_yt + dy
-        return (int(round(384.0 + tx * TILE - map_world_x)),
-                int(round(384.0 + ty * TILE - map_world_y)))
+        return (int(round(map_cx + tx * TILE - map_world_x)),
+                int(round(map_cy + ty * TILE - map_world_y)))
 
-    # Basemap: these tiles were selected using MAP_LAT/MAP_LONG.
-    for (dx, dy), d in state.map_tiles.items():
-        try:
-            img = pygame.image.load(io.BytesIO(d)).convert_alpha()
-            tile_surf.blit(img, tile_position(dx, dy))
-        except Exception:
-            pass
+    if (state._map_render_key is None
+            or state._map_render_key[0] is not state.map_tiles
+            or state._map_render_key[1] is not state.map_label_tiles):
+        base = pygame.Surface((MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA)
+        base.fill(BG)
+        for (dx, dy), blob in state.map_tiles.items():
+            try:
+                image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+                base.blit(image, tile_position(dx, dy))
+            except Exception:
+                pass
+        for (dx, dy), blob in state.map_label_tiles.items():
+            try:
+                image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+                base.blit(image, tile_position(dx, dy))
+            except Exception as e:
+                print(f"Map label draw error: {e}")
+        state._map_render_surface = base
+        state._map_render_key = (state.map_tiles, state.map_label_tiles)
 
-    # Radar uses the same geographic tile positions as the basemap.
-    for (dx, dy), blob in state.radar_tiles.items():
-        try:
-            rd = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-            rd.set_alpha(180)
-            tile_surf.blit(rd, tile_position(dx, dy))
-        except Exception as e:
-            print(f"Radar draw error: {e}")
+    tile_surf = state._map_render_surface.copy()
+    tile_ox = (mw - MAP_SURFACE_W) // 2
+    tile_oy = (mh - MAP_SURFACE_H) // 2
 
-    # ArcGIS city/place-name reference layer.
-    for (dx, dy), blob in state.map_label_tiles.items():
-        try:
-            labels = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-            tile_surf.blit(labels, tile_position(dx, dy))
-        except Exception as e:
-            print(f"Map label draw error: {e}")
+    # RainViewer zoom-7 tiles cover four zoom-9 tiles in each direction.
+    radar_zoom_scale = 2 ** (zoom - RADAR_ZOOM)
+    radar_tile_px = int(TILE * radar_zoom_scale)
+    if state._radar_render_key is not state.radar_tiles:
+        radar_surface = pygame.Surface(
+            (MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA
+        )
+        radar_xt, radar_yt = _tile_xy(MAP_LAT, MAP_LONG, RADAR_ZOOM)
+        for (dx, dy), blob in state.radar_tiles.items():
+            try:
+                radar_x = int(round(
+                    map_cx + (radar_xt + dx) * radar_tile_px - map_world_x
+                ))
+                radar_y = int(round(
+                    map_cy + (radar_yt + dy) * radar_tile_px - map_world_y
+                ))
+                if (radar_x < MAP_SURFACE_W and radar_y < MAP_SURFACE_H
+                        and radar_x + radar_tile_px > 0
+                        and radar_y + radar_tile_px > 0):
+                    image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+                    image.set_alpha(180)
+                    image = pygame.transform.scale(
+                        image, (radar_tile_px, radar_tile_px)
+                    )
+                    radar_surface.blit(image, (radar_x, radar_y))
+            except Exception as e:
+                print(f"Radar draw error: {e}")
+        state._radar_render_surface = radar_surface
+        state._radar_render_key = state.radar_tiles
+    tile_surf.blit(state._radar_render_surface, (0, 0))
+
+    # Draw the rail network below station and train markers.
+    for (lat1, lon1), (lat2, lon2) in state.train_tracks:
+        x1w, y1w = _world_px(lat1, lon1, zoom)
+        x2w, y2w = _world_px(lat2, lon2, zoom)
+        p1 = (int(round(map_cx + x1w - map_world_x)),
+              int(round(map_cy + y1w - map_world_y)))
+        p2 = (int(round(map_cx + x2w - map_world_x)),
+              int(round(map_cy + y2w - map_world_y)))
+        pygame.draw.line(tile_surf, (12, 20, 24), p1, p2, 5)
+        pygame.draw.line(tile_surf, (100, 200, 100), p1, p2, 2)
+
+    for station in state.train_stations:
+        if not station["show_on_map"]:
+            continue
+        station_xw, station_yw = _world_px(
+            station["lat"], station["lon"], zoom
+        )
+        station_x = int(round(map_cx + station_xw - map_world_x))
+        station_y = int(round(map_cy + station_yw - map_world_y))
+        if not (0 <= station_x < MAP_SURFACE_W and 0 <= station_y < MAP_SURFACE_H):
+            continue
+        pygame.draw.circle(tile_surf, (95, 112, 132), (station_x, station_y), 4)
+        pygame.draw.circle(tile_surf, TEXT_BRIGHT, (station_x, station_y), 4, 1)
+
+    heading_vectors = {
+        "N": (0, -1), "NE": (0.707, -0.707), "E": (1, 0),
+        "SE": (0.707, 0.707), "S": (0, 1), "SW": (-0.707, 0.707),
+        "W": (-1, 0), "NW": (-0.707, -0.707),
+    }
+    for train in state.train_positions:
+        train_xw, train_yw = _world_px(train["lat"], train["lon"], zoom)
+        train_x = int(round(map_cx + train_xw - map_world_x))
+        train_y = int(round(map_cy + train_yw - map_world_y))
+        if not (0 <= train_x < MAP_SURFACE_W and 0 <= train_y < MAP_SURFACE_H):
+            continue
+        color = train["color"]
+        radius = 17 if len(train["number"]) >= 3 else 14
+        pygame.draw.circle(tile_surf, (12, 16, 22), (train_x, train_y), radius + 2)
+        pygame.draw.circle(tile_surf, color, (train_x, train_y), radius)
+        pygame.draw.circle(tile_surf, TEXT_BRIGHT, (train_x, train_y), radius, 2)
+        direction_x, direction_y = heading_vectors[train["heading"]]
+        pygame.draw.line(
+            tile_surf, TEXT_BRIGHT,
+            (int(train_x + direction_x * 8), int(train_y + direction_y * 8)),
+            (int(train_x + direction_x * 23), int(train_y + direction_y * 23)), 3,
+        )
+        number = fonts["compact_bold"].render(train["number"], True, TEXT_BRIGHT)
+        tile_surf.blit(number, number.get_rect(center=(train_x, train_y)))
 
     # ------------------------------------------------------------------
     # WEATHER LOCATION -- LATITUDE/LONGITUDE ONLY
     # ------------------------------------------------------------------
     # Project the actual weather coordinates into the same world-pixel
     # coordinate system.  This does not use MAP_LAT or MAP_LONG.
-    weather_lat_rad = math.radians(LATITUDE)
-    weather_world_x = (LONGITUDE + 180.0) / 360.0 * n * TILE
-    weather_world_y = (1.0 - math.log(
-        math.tan(weather_lat_rad) + 1 / math.cos(weather_lat_rad)
-    ) / math.pi) / 2.0 * n * TILE
+    weather_world_x, weather_world_y = _world_px(LATITUDE, LONGITUDE, zoom)
 
     # Because MAP_LAT/MAP_LONG is the exact center of the map, the exact
     # weather coordinate is simply its world-pixel displacement from that
     # independent map center.
-    dot_x = int(round(384.0 + weather_world_x - map_world_x))
-    dot_y = int(round(384.0 + weather_world_y - map_world_y))
+    dot_x = int(round(map_cx + weather_world_x - map_world_x))
+    dot_y = int(round(map_cy + weather_world_y - map_world_y))
 
     pygame.draw.circle(tile_surf, (0, 0, 0), (dot_x, dot_y), 8)
     pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
@@ -1380,26 +1660,159 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
 
     label_x = dot_x - label_box_w // 2
     label_y = dot_y - label_box_h - 12
-    label_x = max(6, min(label_x, 768 - label_box_w - 6))
-    label_y = max(6, min(label_y, 768 - label_box_h - 6))
+    label_x = max(6, min(label_x, MAP_SURFACE_W - label_box_w - 6))
+    label_y = max(6, min(label_y, MAP_SURFACE_H - label_box_h - 6))
     label_box = pygame.Rect(label_x, label_y, label_box_w, label_box_h)
     pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
     pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
     tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
 
     # Rounded clipping mask.
-    mask_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
+    mask_surf = pygame.Surface((MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA)
     mask_surf.fill((0, 0, 0, 0))
-    pygame.draw.rect(mask_surf, (255, 255, 255, 255), (0, 0, 768, 768), border_radius=16)
+    pygame.draw.rect(
+        mask_surf, (255, 255, 255, 255),
+        (0, 0, MAP_SURFACE_W, MAP_SURFACE_H), border_radius=16,
+    )
     tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
     screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
 
 
+def _fit_text(text, font, max_width):
+    if font.size(text)[0] <= max_width:
+        return text
+    while text and font.size(text + "...")[0] > max_width:
+        text = text[:-1]
+    return text + "..." if text else ""
+
+
+def draw_week_forecast_table(screen, state, fonts, x=60, y=260, w=460):
+    """Draw the seven-day forecast in a compact table below current conditions."""
+    daily = (state.weather or {}).get("daily", {})
+    font = fonts["compact"]
+    pygame.draw.rect(screen, PANEL, (x, y + 27, w, 198), border_radius=10)
+    draw_text(screen, "7-DAY FORECAST", fonts["tiny"], TEXT_DIM, x, y)
+    header_y = y + 34
+    draw_text(screen, "DAY", font, TEXT_DIM, x + 10, header_y)
+    draw_text(screen, "CONDITION", font, TEXT_DIM, x + 63, header_y)
+    draw_text(screen, "HIGH / LOW", font, TEXT_DIM, x + 360, header_y, anchor="topright")
+    draw_text(screen, "RAIN", font, TEXT_DIM, x + w - 10, header_y, anchor="topright")
+
+    for i in range(7):
+        row_y = y + 59 + i * 22
+        row_rect = pygame.Rect(x + 5, row_y, w - 10, 21)
+        if i % 2 == 0:
+            pygame.draw.rect(screen, (24, 32, 49), row_rect, border_radius=4)
+        if (len(daily.get("time", [])) <= i
+                or len(daily.get("weather_code", [])) <= i
+                or len(daily.get("temperature_2m_max", [])) <= i
+                or len(daily.get("temperature_2m_min", [])) <= i
+                or len(daily.get("precipitation_sum", [])) <= i):
+            draw_text(screen, "--", font, TEXT_DIM, x + 10, row_y)
+            draw_text(screen, "No forecast", font, TEXT_DIM, x + 63, row_y)
+            continue
+
+        date = datetime.strptime(daily["time"][i], "%Y-%m-%d")
+        code = daily["weather_code"][i]
+        draw_text(screen, date.strftime("%a"), font, TEXT_BRIGHT, x + 10, row_y)
+        draw_weather_icon(screen, code, x + 70, row_y + 10, 6, GOLD)
+        condition = _fit_text(WMO_DESC.get(code, ""), font, 132)
+        draw_text(screen, condition, font, ACCENT, x + 88, row_y)
+        nws = state.nws_hilo.get(daily["time"][i])
+        high = round(nws[0]) if nws and nws[0] is not None else round(
+            daily["temperature_2m_max"][i]
+        )
+        low = round(nws[1]) if nws and nws[1] is not None else round(
+            daily["temperature_2m_min"][i]
+        )
+        draw_text(
+            screen, f"{high}° / {low}°", font, TEXT_BRIGHT, x + 360, row_y,
+            anchor="topright",
+        )
+        precip_in = daily["precipitation_sum"][i] / 25.4
+        rain_text = f"~{precip_in:.2f}\"" if precip_in > 0.01 else "Dry"
+        draw_text(
+            screen, rain_text, font, RAIN if precip_in > 0.01 else TEXT_DIM,
+            x + w - 10, row_y, anchor="topright",
+        )
+
+
+def draw_train_panel(screen, state, fonts, x=1480, y=130, w=380, h=820):
+    """Draw nearby live trains in a compact right-side tracking panel."""
+    panel = pygame.Rect(x, y, w, h)
+    pygame.draw.rect(screen, PANEL, panel, border_radius=12)
+    pygame.draw.rect(screen, (48, 64, 82), panel, 1, border_radius=12)
+
+    draw_text(screen, "LIVE TRAIN TRACKING", fonts["small"], TEXT_BRIGHT, x + 16, y + 14)
+    nearby = [
+        (train, _distance_miles((MAP_LAT, MAP_LONG), (train["lat"], train["lon"])))
+        for train in state.train_positions
+    ]
+    nearby = sorted(
+        ((train, miles) for train, miles in nearby if miles <= 200),
+        key=lambda item: item[1],
+    )
+    count_text = f"{len(nearby)} trains within 200 mi"
+    draw_text(screen, count_text, fonts["compact"], TEXT_DIM, x + 16, y + 48)
+
+    if not state.train_data_loaded:
+        message = "Train data unavailable" if state.train_error else "Loading train data..."
+        draw_text(screen, message, fonts["compact"], GOLD, x + 16, y + 96)
+        return
+    if not nearby:
+        draw_text(screen, "No trains within 200 mi", fonts["compact"], TEXT_DIM, x + 16, y + 96)
+        return
+
+    now = time.time()
+    age = now - state.last_train_upd if state.last_train_upd else None
+    if state.train_error or (age is not None and age > TRAIN_UPDATE_INTERVAL_S * 4):
+        status, color = "STALE", GOLD
+    else:
+        status, color = "LIVE", GREEN
+    draw_text(screen, status, fonts["compact"], color, x + w - 16, y + 48, anchor="topright")
+    pygame.draw.line(screen, (48, 64, 82), (x + 12, y + 78), (x + w - 12, y + 78), 1)
+
+    content_x = x + 12
+    content_w = w - 24
+    footer_h = 42
+    row_h = 82
+    rows_per_page = max(1, (h - 88 - footer_h) // row_h)
+    page_count = max(1, math.ceil(len(nearby) / rows_per_page))
+    page_idx = int(time.time() // 10) % page_count
+    page_start = page_idx * rows_per_page
+    page_trains = nearby[page_start:page_start + rows_per_page]
+    for i, (train, miles) in enumerate(page_trains):
+        row_y = y + 88 + i * row_h
+        card = pygame.Rect(content_x, row_y, content_w, row_h - 7)
+        pygame.draw.rect(screen, (24, 32, 49), card, border_radius=7)
+        pygame.draw.rect(screen, (48, 64, 82), card, 1, border_radius=7)
+        pygame.draw.circle(screen, train["color"], (card.left + 15, card.top + 16), 6)
+        title = f"#{train['number']}  {train['name']}"
+        title = _fit_text(title, fonts["compact_bold"], content_w - 42)
+        draw_text(screen, title, fonts["compact_bold"], TEXT_BRIGHT, card.left + 28, card.top + 6)
+        next_stop = _fit_text(f"Next: {train['next_stop']}", fonts["compact"], content_w - 18)
+        draw_text(screen, next_stop, fonts["compact"], ACCENT, card.left + 10, card.top + 29)
+        details = f"{train['speed']:.0f} mph  {train['heading']}  ·  {miles:.0f} mi away"
+        details = _fit_text(details, fonts["compact"], content_w - 18)
+        draw_text(screen, details, fonts["compact"], TEXT_DIM, card.left + 10, card.top + 52)
+
+    page_label = f"Page {page_idx + 1}/{page_count}"
+    draw_text(
+        screen, page_label, fonts["compact"], TEXT_DIM,
+        x + w - 16, y + h - 30, anchor="topright",
+    )
+    if page_count > 1:
+        draw_text(
+            screen, "Pages change every 10 seconds",
+            fonts["compact"], TEXT_DIM, x + 16, y + h - 30,
+        )
+
+
 def draw_wind_widget(screen, state, fonts, cx, cy):
     """Compass rose with arrow pointing toward where wind is going.
     cx, cy = center of circle."""
-    RADIUS = 52
+    RADIUS = WIND_WIDGET_RADIUS
     cur = state.weather["current"] if state.weather else None
 
     if cur is None:
@@ -1681,10 +2094,10 @@ def draw_nflstats_widget(screen, state, fonts, x, y, w=440, h=200):
 _COL_X        = 60    # x for text-only widgets (SUNTIME title row, RAM labels)
 _COL_WIDGET_X = 80    # x for chart / bar widgets
 _COL_W        = 440   # width for chart / bar widgets  (right edge at x = 520)
-_COL_Y_TOP    = 350   # top of dynamic zone (just below current-temp / icon block)
-_COL_Y_BOT    = 1000  # bottom of dynamic zone (above MOTD bar)
+_COL_Y_TOP    = 505   # below the compact seven-day forecast table
+_COL_Y_BOT    = 1030  # leave room for the MOTD line
 _COL_MAX_GAP  = 40    # maximum gap between adjacent widgets (actual gap is computed dynamically)
-_COL_MAX_H    = 400   # maximum height a growable widget may reach
+_COL_MAX_H    = 455   # maximum height a growable widget may reach
 
 # Ordered catalog: (feature_key, min_h, growable)
 # Growable widgets grow equally to fill leftover space (up to _COL_MAX_H).
@@ -2112,7 +2525,6 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
 def draw_screen(screen, state, fonts, tick):
     screen.fill(BG)
     W, H = screen.get_size()
-    from datetime import timedelta as _td
 
     with state.lock:
         started_at = state.started_at
@@ -2120,33 +2532,27 @@ def draw_screen(screen, state, fonts, tick):
         runtime_error_source = state.runtime_error_source
         runtime_error_message = state.runtime_error_message
         now_local = datetime.now().astimezone()
-        draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         date_display = now_local.strftime("%A, %B %-d, %Y")
         tz_abbrev = now_local.tzname() or "UNKNOWN"
         draw_text(screen, date_display, fonts["small"], TEXT_DIM, W // 2, 52, anchor="midtop")
+        draw_text(
+            screen, datetime.now().strftime("%I:%M %p"), fonts["medium"],
+            TEXT_DIM, W - 60, 40, anchor="topright",
+        )
 
         cur = (state.weather or {}).get("current")
         obs_temp_f = state.obs_temp_f
-        daily = (state.weather or {}).get("daily")
         has_current = bool(cur and "temperature_2m" in cur and "weather_code" in cur)
-        has_daily = bool(
-            daily
-            and len(daily.get("time", [])) >= 7
-            and len(daily.get("weather_code", [])) >= 7
-            and len(daily.get("temperature_2m_max", [])) >= 7
-            and len(daily.get("temperature_2m_min", [])) >= 7
-            and len(daily.get("precipitation_sum", [])) >= 7
-        )
 
         # Current temp + icon
         if has_current:
             shown_temp_f = obs_temp_f if obs_temp_f is not None else cur["temperature_2m"]
             temp_str = f"{round(shown_temp_f)}°"
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
-            screen.blit(temp_surf, (60, 140))
-            icon_x = 60 + temp_surf.get_width() + 18 + 65
-            draw_weather_icon(screen, cur["weather_code"], icon_x, 195, 130, GOLD)
+            screen.blit(temp_surf, (60, 80))
+            icon_x = 60 + temp_surf.get_width() + 18 + 55
+            draw_weather_icon(screen, cur["weather_code"], icon_x, 135, 85, GOLD)
         else:
             bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
             if bootstrap_loading:
@@ -2157,50 +2563,14 @@ def draw_screen(screen, state, fonts, tick):
                 draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
 
 
-        # Map box centered between left widget column and right 7-day panel.
-        left_col_right = 520
-        right_panel_left = W - 430
-        mw, mh = 820, 720
-        mx = left_col_right + (right_panel_left - left_col_right - mw) // 2
-        my = 160
+        mx, my = 560, 130
+        mw, mh = MAP_SURFACE_W, MAP_SURFACE_H
         draw_map(screen, state, fonts, mx, my, mw, mh)
+        draw_train_panel(screen, state, fonts)
 
-        # Wind widget — center from the actual rendered 768px map surface.
-        map_draw_x = mx + (mw - 768) // 2
-        map_center_x = map_draw_x + 768 // 2
-        draw_wind_widget(screen, state, fonts, map_center_x - 10, my + mh + 6)
-
-        # 7-Day Forecast
-        for i in range(7):
-            ry = 140 + (i * 120)
-            pygame.draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
-            if has_daily:
-                dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
-                code = daily["weather_code"][i]
-                draw_weather_icon(screen, code, W-407, ry+55, 46, GOLD)
-                draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
-                desc = WMO_DESC.get(code, "")
-                draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
-                hi_raw = round(daily["temperature_2m_max"][i])
-                lo_raw = round(daily["temperature_2m_min"][i])
-                nws = state.nws_hilo.get(daily["time"][i])
-                hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
-                lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
-                draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
-                draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+52)
-                precip_mm = daily["precipitation_sum"][i]
-                precip_in = precip_mm / 25.4
-                if precip_in > 0.01:
-                    draw_text(screen, f"~{precip_in:.2f}\"", fonts["small"], RAIN, W-45, ry+78, anchor="topright")
-                else:
-                    draw_text(screen, "Dry", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
-            else:
-                dt = datetime.now() + _td(days=i)
-                draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
-                draw_text(screen, "No forecast", fonts["small"], TEXT_DIM, W-372, ry+50)
-                draw_text(screen, "--", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
-                draw_text(screen, "--", fonts["small"], TEXT_DIM, W-178, ry+52)
-                draw_text(screen, "N/A", fonts["small"], TEXT_DIM, W-45, ry+78, anchor="topright")
+        wind_center_y = my + mh + 42
+        draw_wind_widget(screen, state, fonts, mx + mw // 2, wind_center_y)
+        draw_week_forecast_table(screen, state, fonts)
 
         # Left-column dynamic layout — positions and heights computed by _left_column_layout()
         for _wkey, _wy, _wh in _left_column_layout():
@@ -2234,7 +2604,9 @@ def draw_screen(screen, state, fonts, tick):
         motd_surf = fonts[font_key].render(state.motd, True, GOLD)
         if motd_surf.get_width() <= max_w:
             break
-    screen.blit(motd_surf, motd_surf.get_rect(center=(W // 2, H - 40)))
+    wind_bottom = wind_center_y + WIND_WIDGET_RADIUS + 41
+    motd_center_y = (wind_bottom + H - 12) // 2
+    screen.blit(motd_surf, motd_surf.get_rect(center=(W // 2, motd_center_y)))
 
     # Cycle MOTD every 30 seconds; retry fetch if pool is empty or exhausted
     now = time.time()
@@ -2264,6 +2636,8 @@ def main():
         "medium": pygame.font.Font(regular_font_path, 40),
         "small":  pygame.font.Font(regular_font_path, 30),
         "tiny":   pygame.font.Font(regular_font_path, 20),
+        "compact": pygame.font.Font(regular_font_path, 16),
+        "compact_bold": pygame.font.Font(bold_font_path, 16),
     }
 
     state = AppState()
@@ -2288,9 +2662,11 @@ def main():
     _spawn("QUOTES", state.update_quotes)
     state.last_weather_upd = time.time()
     state.last_map_upd = time.time()
+    state.last_train_upd = time.time()
     state.last_ram_upd = time.time()
 
     _spawn_delayed(5, "MAP", state.update_map)
+    _spawn_delayed(8, "TRAINS", state.update_trains)
     if FEATURES["RAM_PRICE"]: _spawn_delayed(8, "RAM", state.update_ram)
     if FEATURES["OSV_TIDES"]: _spawn_delayed(3, "TIDES", state.update_tides)
     if FEATURES["OSV_COUNT"]: _spawn_delayed(6, "OSV", state.update_osv)
@@ -2316,6 +2692,9 @@ def main():
         if now - state.last_map_upd > 60 and not state._map_running:
             state.last_map_upd = now
             _spawn("MAP", state.update_map)
+        if now - state.last_train_upd > TRAIN_UPDATE_INTERVAL_S and not state._train_running:
+            state.last_train_upd = now
+            _spawn("TRAINS", state.update_trains)
         if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
             state.last_ram_upd = now
             _spawn("RAM", state.update_ram)
