@@ -64,7 +64,7 @@ SCREEN_W, SCREEN_H = 1920, 1080
 MAP_ZOOM = 9
 RADAR_ZOOM = 7  # RainViewer tiles are available up to zoom 7
 MAP_SURFACE_W, MAP_SURFACE_H = 900, 780
-WIND_WIDGET_RADIUS = 32
+WIND_WIDGET_RADIUS = 42
 TRAIN_UPDATE_INTERVAL_S = 30
 SELF_UPDATE_INTERVAL_S = config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=6 * 3600)
 SELF_UPDATE_TIMEOUT_S = 120
@@ -1459,10 +1459,10 @@ def _maybe_self_update_and_restart(repo_dir):
         return False
 
     before = _git_head(repo_dir)
-    print("Self-update: running git pull")
+    print("Self-update: running git pull origin train-station")
     try:
         pull = subprocess.run(
-            ["git", "pull"],
+            ["git", "pull", "origin", "train-station"],
             cwd=repo_dir,
             capture_output=True,
             text=True,
@@ -1574,7 +1574,7 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
                         and radar_y + radar_tile_px > 0):
                     image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
                     image.set_alpha(180)
-                    image = pygame.transform.scale(
+                    image = pygame.transform.smoothscale(
                         image, (radar_tile_px, radar_tile_px)
                     )
                     radar_surface.blit(image, (radar_x, radar_y))
@@ -2552,7 +2552,7 @@ def draw_screen(screen, state, fonts, tick):
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
             screen.blit(temp_surf, (60, 80))
             icon_x = 60 + temp_surf.get_width() + 18 + 55
-            draw_weather_icon(screen, cur["weather_code"], icon_x, 135, 85, GOLD)
+            draw_weather_icon(screen, cur["weather_code"], icon_x, 175, 60, GOLD)
         else:
             bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
             if bootstrap_loading:
@@ -2568,7 +2568,7 @@ def draw_screen(screen, state, fonts, tick):
         draw_map(screen, state, fonts, mx, my, mw, mh)
         draw_train_panel(screen, state, fonts)
 
-        wind_center_y = my + mh + 42
+        wind_center_y = my + mh + 33
         draw_wind_widget(screen, state, fonts, mx + mw // 2, wind_center_y)
         draw_week_forecast_table(screen, state, fonts)
 

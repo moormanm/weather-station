@@ -18,6 +18,6 @@ fi
 cd "/home/pi/weather-station"
 
 # get latest
-git pull origin main
+git pull origin train-station
 
 exec /usr/bin/python3 -u "/home/pi/weather-station/weather_station.py" > "/home/pi/weather_station.log" 2>&1
