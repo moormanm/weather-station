@@ -1606,7 +1606,7 @@ def draw_osv_widget(screen, state, fonts, x, y, w=480):
 
     # Reported-at timestamp
     if reported:
-        ts_str = reported.strftime("%-I:%M %p")
+        ts_str = reported.strftime("%I:%M %p").lstrip("0")
         draw_text(screen, f"as of {ts_str}", fonts["tiny"], TEXT_DIM, x + w, bar_y + bar_h + 8, anchor="topright")
 
 
@@ -1754,8 +1754,8 @@ def draw_suntime(screen, state, fonts, x, y):
     if not sunrises or not sunsets:
         return
     try:
-        rise = datetime.strptime(sunrises[0], "%Y-%m-%dT%H:%M").strftime("%-I:%M %p")
-        setr = datetime.strptime(sunsets[0],  "%Y-%m-%dT%H:%M").strftime("%-I:%M %p")
+        rise = datetime.strptime(sunrises[0], "%Y-%m-%dT%H:%M").strftime("%I:%M %p").lstrip("0")
+        setr = datetime.strptime(sunsets[0],  "%Y-%m-%dT%H:%M").strftime("%I:%M %p").lstrip("0")
     except Exception:
         return
     draw_text(screen, "Sun up",            fonts["tiny"],  TEXT_DIM, x,       y + 2)
@@ -2122,7 +2122,7 @@ def draw_screen(screen, state, fonts, tick):
         now_local = datetime.now().astimezone()
         draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
-        date_display = now_local.strftime("%A, %B %-d, %Y")
+        date_display = f"{now_local:%A, %B} {now_local.day}, {now_local:%Y}"
         tz_abbrev = now_local.tzname() or "UNKNOWN"
         draw_text(screen, date_display, fonts["small"], TEXT_DIM, W // 2, 52, anchor="midtop")
 
@@ -2251,6 +2251,8 @@ def draw_screen(screen, state, fonts, tick):
 
 
 def main():
+    if sys.platform == "win32":
+        os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
     pygame.mouse.set_visible(False)
