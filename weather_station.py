@@ -2076,6 +2076,16 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
               chart_x + chart_w - 2, chart_y + 2, anchor="topright")
 
 
+def _daily_temperatures(daily, index, nws_hilo):
+    """Use full-day values for today and valid NWS pairs for later days."""
+    hi = daily["temperature_2m_max"][index]
+    lo = daily["temperature_2m_min"][index]
+    nws = nws_hilo.get(daily["time"][index])
+    if index > 0 and nws and nws[0] is not None and nws[1] is not None and nws[0] >= nws[1]:
+        hi, lo = nws
+    return round(hi), round(lo)
+
+
 def draw_screen(screen, state, fonts, tick):
     screen.fill(BG)
     W, H = screen.get_size()
@@ -2146,11 +2156,7 @@ def draw_screen(screen, state, fonts, tick):
                 draw_text(screen, dt.strftime("%a").upper(), fonts["small"], TEXT_BRIGHT, W-372, ry+12)
                 desc = WMO_DESC.get(code, "")
                 draw_text(screen, desc, fonts["small"], ACCENT, W-372, ry+50)
-                hi_raw = round(daily["temperature_2m_max"][i])
-                lo_raw = round(daily["temperature_2m_min"][i])
-                nws = state.nws_hilo.get(daily["time"][i])
-                hi = round(nws[0]) if nws and nws[0] is not None else hi_raw
-                lo = round(nws[1]) if nws and nws[1] is not None else lo_raw
+                hi, lo = _daily_temperatures(daily, i, state.nws_hilo)
                 draw_text(screen, f"{hi}°", fonts["medium"], TEXT_BRIGHT, W-178, ry+8)
                 draw_text(screen, f"{lo}°", fonts["small"],  TEXT_DIM,    W-178, ry+52)
                 precip_mm = daily["precipitation_sum"][i]
