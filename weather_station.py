@@ -98,7 +98,6 @@ _NWS_ENDPOINTS_LOCK = threading.Lock()
 _TTL_OPEN_METEO   = 60
 _TTL_NWS_FORECAST = 60
 _TTL_NWS_HOURLY   = 300
-_TTL_NWS_OBS      = 60
 _TTL_NWS_OBS_LIST = 60
 
 _HTTP_CACHE = {}
@@ -464,9 +463,8 @@ def _resolve_nws_endpoints():
 
 
 def _fetch_nws_hilo(forecast_url, stations_url):
-    """Return (hilo_dict, current_obs_temp_f) from NWS forecast + observations."""
+    """Return daily highs and lows from NWS forecasts and observations."""
     hilo = {}
-    current_obs_temp_f = None
     try:
         # NWS 7-day forecast for days 1+
         raw = _cached_fetch(forecast_url, _TTL_NWS_FORECAST, timeout=15, retries=2)
@@ -491,28 +489,12 @@ def _fetch_nws_hilo(forecast_url, stations_url):
         print(f"NWS forecast fetch error: {e}")
 
     try:
-        # Current observed temp from nearest NWS station.
-        # Use /latest to avoid stale ordering/caching issues in the /observations list.
-        latest_url = stations_url.split("?", 1)[0].rstrip("/") + "/latest?require_qc=true"
-        latest_raw = _cached_fetch(latest_url, _TTL_NWS_OBS, timeout=15, retries=2)
-        if latest_raw and latest_raw != "RATE_LIMITED":
-            latest_props = _json_or_raise(latest_raw, f"NWS latest observation ({latest_url})").get("properties", {})
-            t_obj = latest_props.get("temperature") or {}
-            t_c = t_obj.get("value")
-            if t_c is not None:
-                current_obs_temp_f = t_c * 9 / 5 + 32
-    except Exception as e:
-        print(f"NWS latest observation fetch error: {e}")
-
-    try:
         # Today's observed high from nearest NWS observation station
         raw = _cached_fetch(stations_url, _TTL_NWS_OBS_LIST, timeout=15, retries=2)
         if raw and raw != "RATE_LIMITED":
             obs = _json_or_raise(raw, f"NWS station observations ({stations_url})")["features"]
             today = datetime.now().strftime("%Y-%m-%d")
             today_temps = []
-            newest_ts = None
-            newest_temp_f = None
             for o in obs:
                 props = o.get("properties", {})
                 ts = props.get("timestamp")
@@ -522,18 +504,6 @@ def _fetch_nws_hilo(forecast_url, stations_url):
                     t_f = t_c * 9 / 5 + 32
                     if ts[:10] == today:
                         today_temps.append(t_f)
-
-                    # Fallback in case /latest fails.
-                    try:
-                        ts_dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-                    except Exception:
-                        ts_dt = None
-                    if ts_dt is not None and (newest_ts is None or ts_dt > newest_ts):
-                        newest_ts = ts_dt
-                        newest_temp_f = t_f
-
-            if current_obs_temp_f is None and newest_temp_f is not None:
-                current_obs_temp_f = newest_temp_f
 
             if today_temps:
                 obs_hi = round(max(today_temps))
@@ -545,7 +515,7 @@ def _fetch_nws_hilo(forecast_url, stations_url):
     except Exception as e:
         print(f"NWS observation fetch error: {e}")
 
-    return hilo, current_obs_temp_f
+    return hilo
 
 
 def _fetch_nws_hourly(forecast_url):
@@ -643,7 +613,6 @@ class AppState:
         self.weather_loaded_once = False
         self.weather = None
         self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
-        self.obs_temp_f = None          # nearest NWS station current temp in Fahrenheit
         self.nws_hourly_precip = None   # NWS hourly POP data mapped to open-meteo style hourly keys
         self.nws_hourly_temp = None     # NWS hourly temp data mapped to open-meteo style hourly keys
         self.map_tiles = {}
@@ -748,10 +717,10 @@ class AppState:
                 return
 
             nws_error = None
-            nws_hilo, obs_temp_f = None, None
+            nws_hilo = None
             nws_hourly = None
             try:
-                nws_hilo, obs_temp_f = _fetch_nws_hilo(forecast_url, stations_url)
+                nws_hilo = _fetch_nws_hilo(forecast_url, stations_url)
                 # These two series only feed the ALT_PREDICTIONS overlay, so
                 # there is nothing to fetch when that overlay is turned off.
                 if FEATURES.get("ALT_PREDICTIONS", False):
@@ -767,8 +736,6 @@ class AppState:
                 self.weather = data
                 if nws_hilo is not None:
                     self.nws_hilo = nws_hilo
-                if obs_temp_f is not None:
-                    self.obs_temp_f = obs_temp_f
                 if nws_hourly is not None:
                     self.nws_hourly_precip, self.nws_hourly_temp = nws_hourly
                     self.nws_hourly_source = "NWS"
@@ -2127,7 +2094,6 @@ def draw_screen(screen, state, fonts, tick):
         draw_text(screen, date_display, fonts["small"], TEXT_DIM, W // 2, 52, anchor="midtop")
 
         cur = (state.weather or {}).get("current")
-        obs_temp_f = state.obs_temp_f
         daily = (state.weather or {}).get("daily")
         has_current = bool(cur and "temperature_2m" in cur and "weather_code" in cur)
         has_daily = bool(
@@ -2141,8 +2107,7 @@ def draw_screen(screen, state, fonts, tick):
 
         # Current temp + icon
         if has_current:
-            shown_temp_f = obs_temp_f if obs_temp_f is not None else cur["temperature_2m"]
-            temp_str = f"{round(shown_temp_f)}°"
+            temp_str = f"{round(cur['temperature_2m'])}°"
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
             screen.blit(temp_surf, (60, 140))
             icon_x = 60 + temp_surf.get_width() + 18 + 65
