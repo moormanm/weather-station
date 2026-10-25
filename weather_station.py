@@ -44,6 +44,7 @@ LOCATION_NAME = config.get("LOCATION", "NAME")
 FEATURES = {
     "OSV_COUNT":       config.getboolean("FEATURES", "OSV_COUNT",       fallback=False),
     "OSV_TIDES":       config.getboolean("FEATURES", "OSV_TIDES",       fallback=False),
+    "COORDINATE_TIDES": config.getboolean("FEATURES", "COORDINATE_TIDES", fallback=False),
     "RAM_PRICE":       config.getboolean("FEATURES", "RAM_PRICE",       fallback=False),
     "HOURLY_FORECAST": config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
     "HOURLY_PRECIP":   config.getboolean(
@@ -607,6 +608,31 @@ def _fetch_ddr5_price():
     return None, None
 
 
+def _resolve_tide_station():
+    raw = safe_fetch(
+        "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions",
+        timeout=15,
+    )
+    if not raw or raw == "RATE_LIMITED":
+        raise ValueError("NOAA tide station list is not available")
+    stations = json.loads(raw.decode()).get("stations", [])
+    if not stations:
+        raise ValueError("No NOAA tide prediction stations found")
+    lat, lon = math.radians(LATITUDE), math.radians(LONGITUDE)
+
+    def distance(station):
+        station_lat = math.radians(float(station["lat"]))
+        station_lon = math.radians(float(station["lng"]))
+        # The haversine value increases with great-circle distance.
+        return (
+            math.sin((station_lat - lat) / 2) ** 2
+            + math.cos(lat) * math.cos(station_lat)
+            * math.sin((station_lon - lon) / 2) ** 2
+        )
+
+    return min(stations, key=distance)
+
+
 class AppState:
     def __init__(self):
         self.started_at = time.time()
@@ -634,6 +660,7 @@ class AppState:
         self.ram_delta_7d = None        # dollar diff vs ~7d ago
         # Tide state
         self.tides = []              # list of {"t": "HH:MM", "v": float, "type": "H"/"L"} for today+tomorrow
+        self.tide_station = None
         self.last_tide_upd = 0
         self._tide_running = False
         # OSV state
@@ -932,11 +959,18 @@ class AppState:
 
     def _do_update_tides(self):
         from datetime import date as _date, timedelta as _td
+        station_id = "8570283"
+        if FEATURES["COORDINATE_TIDES"]:
+            if self.tide_station is None:
+                station = _resolve_tide_station()
+                with self.lock:
+                    self.tide_station = station
+            station_id = self.tide_station["id"]
         today    = _date.today().strftime("%Y%m%d")
         tomorrow = (_date.today() + _td(days=1)).strftime("%Y%m%d")
         url = (
             "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
-            f"?station=8570283&product=predictions&datum=MLLW"
+            f"?station={station_id}&product=predictions&datum=MLLW"
             f"&time_zone=lst_ldt&interval=hilo&units=english"
             f"&application=weather_station&format=json"
             f"&begin_date={today}&end_date={tomorrow}"
@@ -1441,7 +1475,10 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
     x,y = top-left corner.  w×h = bounding box."""
     from datetime import date as _date
     title_y = y + 4
-    draw_text(screen, "Ocean City Tides", fonts["tiny"], TEXT_DIM, x, title_y)
+    title = "Ocean City Tides"
+    if FEATURES["COORDINATE_TIDES"]:
+        title = f"Tides: {state.tide_station['name']}" if state.tide_station else "Local Tides"
+    draw_text(screen, title, fonts["tiny"], TEXT_DIM, x, title_y)
 
     tides = state.tides  # today + tomorrow from NOAA
 
@@ -1675,7 +1712,10 @@ def _left_column_layout():
     evenly, up to _COL_MAX_GAP.  After the gap is fixed, any leftover space
     goes to the growable chart widgets (up to _COL_MAX_H each).
     """
-    active = [(key, mn, grow) for key, mn, grow in _COL_CATALOG if FEATURES.get(key)]
+    active = [
+        (key, mn, grow) for key, mn, grow in _COL_CATALOG
+        if FEATURES.get(key) or (key == "OSV_TIDES" and FEATURES["COORDINATE_TIDES"])
+    ]
     if not active:
         return []
 
@@ -2265,7 +2305,7 @@ def main():
 
     _spawn_delayed(5, "MAP", state.update_map)
     if FEATURES["RAM_PRICE"]: _spawn_delayed(8, "RAM", state.update_ram)
-    if FEATURES["OSV_TIDES"]: _spawn_delayed(3, "TIDES", state.update_tides)
+    if FEATURES["OSV_TIDES"] or FEATURES["COORDINATE_TIDES"]: _spawn_delayed(3, "TIDES", state.update_tides)
     if FEATURES["OSV_COUNT"]: _spawn_delayed(6, "OSV", state.update_osv)
     if FEATURES["POTOMAC"]:   _spawn_delayed(7, "POTOMAC", state.update_potomac)
     if FEATURES["NFLSTATS"] and NFL_API_KEY: _spawn_delayed(9, "NFL", state.update_nflstats)
@@ -2292,7 +2332,7 @@ def main():
         if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
             state.last_ram_upd = now
             _spawn("RAM", state.update_ram)
-        if now - state.last_tide_upd > 300 and not state._tide_running and FEATURES["OSV_TIDES"]:
+        if now - state.last_tide_upd > 300 and not state._tide_running and (FEATURES["OSV_TIDES"] or FEATURES["COORDINATE_TIDES"]):
             state.last_tide_upd = now
             _spawn("TIDES", state.update_tides)
         if now - state.last_osv_upd > 60 and not state._osv_running and FEATURES["OSV_COUNT"]:

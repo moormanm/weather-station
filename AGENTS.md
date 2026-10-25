@@ -49,6 +49,7 @@ Some features are off by default. Enable in `~/ws-settings.ini` under `[FEATURES
 
 - `OSV_COUNT`
 - `OSV_TIDES`
+- `COORDINATE_TIDES` (nearest NOAA tide prediction station to `LATITUDE`/`LONGITUDE`; takes priority over `OSV_TIDES`, with one chart)
 - `RAM_PRICE`
 - `HOURLY_FORECAST`
 - `HOURLY_PRECIP` (if omitted, it falls back to the `HOURLY_FORECAST` value)
@@ -72,7 +73,7 @@ Still hardcoded in `weather_station.py` (not in settings):
 ```python
 SCREEN_W, SCREEN_H = 1920, 1080
 MAP_ZOOM = 7
-NOAA tide station = 8570283
+OSV_TIDES NOAA tide station = 8570283 (COORDINATE_TIDES selects the nearest prediction station)
 font = "dejavusans"
 ```
 

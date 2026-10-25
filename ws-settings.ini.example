@@ -1,6 +1,10 @@
 
 [LOCATION]
 
+#LATITUDE=38.5003345
+#LONGITUDE=-76.5038636
+#NAME=Port Republic, MD
+
 #LATITUDE=38.3663
 #LONGITUDE=-75.15426
 #NAME=Ocean Pines, MD
@@ -22,6 +26,8 @@
 RAM_PRICE=false
 OSV_COUNT=false
 OSV_TIDES=false
+# Use the nearest NOAA tide prediction station. Takes priority over OSV_TIDES.
+COORDINATE_TIDES=false
 HOURLY_FORECAST=false
 HOURLY_PRECIP=false
 SUNTIME=false
