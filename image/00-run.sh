@@ -16,6 +16,7 @@ fi
 install -m 644 files/wallpaper "$SHARE/wallpaper"
 install -m 644 files/openbox.xml "$SHARE/openbox.xml"
 install -m 755 files/weather-station-session files/weather-station-launch \
+    files/weather-station-settings \
     "${ROOTFS_DIR}/usr/local/bin/"
 
 cat > "${ROOTFS_DIR}/usr/share/xsessions/weather-station.desktop" <<'EOF'
@@ -49,6 +50,15 @@ Type=Application
 Name=Wi-Fi Settings
 Exec=xterm -T "Wi-Fi Settings" -e nmtui
 Icon=network-wireless
+Terminal=false
+EOF
+
+cat > "${ROOTFS_DIR}${HOME_DIR}/Desktop/settings.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Edit Weather Station Settings
+Exec=/usr/local/bin/weather-station-settings
+Icon=accessories-text-editor
 Terminal=false
 EOF
 chmod 755 "${ROOTFS_DIR}${HOME_DIR}/Desktop/"*.desktop

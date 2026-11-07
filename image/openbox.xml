@@ -7,6 +7,21 @@
     <keybind key="A-F4">
       <action name="Close"/>
     </keybind>
+    <keybind key="C-A-e">
+      <action name="Execute">
+        <command>/usr/local/bin/weather-station-settings</command>
+      </action>
+    </keybind>
+    <keybind key="C-A-w">
+      <action name="Execute">
+        <command>xterm -T "Wi-Fi Settings" -e nmtui</command>
+      </action>
+    </keybind>
+    <keybind key="C-A-s">
+      <action name="Execute">
+        <command>/usr/local/bin/weather-station-launch</command>
+      </action>
+    </keybind>
   </keyboard>
   <mouse>
     <context name="Titlebar">

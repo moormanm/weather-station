@@ -30,8 +30,10 @@ The first build still needs internet access and time to install these packages.
 Output: .image-build/base-*/weather-station.img
 Select "Use custom" in Raspberry Pi Imager. Skip OS customisation.
 The image includes pi/pi, automatic login, US Wi-Fi, and disabled SSH.
-Press Q to show the wallpaper and Wi-Fi Settings / Start Weather Station shortcuts.
-Wi-Fi Settings uses a keyboard interface. The app starts without a Git request.
+Press Q to show the desktop. It has shortcuts for settings, Wi-Fi, and the app.
+Use Ctrl+Alt+E to edit settings, Ctrl+Alt+W for Wi-Fi, or Ctrl+Alt+S to start.
+The settings editor and Wi-Fi tool support keyboard input. The app starts
+without a Git request.
 
 Your settings are included in the output. Do not share personal settings or secrets.
 The app is cloned from GitHub; local uncommitted changes are not included.
@@ -89,7 +91,8 @@ BUILD="$(mktemp -d "$ROOT/.image-build/base-XXXXXXXX")"
 mkdir "$BUILD/files"
 cp "$SETTINGS" "$BUILD/files/ws-settings.ini"
 cp "$WALLPAPER" "$BUILD/files/wallpaper"
-cp "$ROOT/image/"{weather-station-session,weather-station-launch,openbox.xml} "$BUILD/files/"
+cp "$ROOT/image/"{weather-station-session,weather-station-launch,weather-station-settings,openbox.xml} \
+    "$BUILD/files/"
 git clone --depth 1 --branch "$REF" --single-branch -- "$REPOSITORY" \
     "$BUILD/files/weather-station"
 [ -f "$BUILD/files/weather-station/weather_station.py" ] ||
