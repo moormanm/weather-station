@@ -32,8 +32,8 @@ Output: .image-build/base-*/weather-station.img
 Select "Use custom" in Raspberry Pi Imager. Skip OS customisation.
 The image includes pi/pi, automatic login, and disabled SSH.
 The keyboard uses the US English layout and the Wi-Fi country is US.
-On first boot, configure the time zone, Wi-Fi, and station location.
-Look up a US street address online, or enter coordinates manually.
+On first boot, configure Wi-Fi and station settings. The station address is
+looked up online, and its time zone is set automatically.
 Press Q to show the desktop. Use Weather Station Setup to run setup again.
 Setup requires an active Wi-Fi connection and uses keyboard-driven forms.
 Use Ctrl+Alt+E to edit settings, Ctrl+Alt+W for Wi-Fi, or Ctrl+Alt+S to start.

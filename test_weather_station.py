@@ -363,25 +363,24 @@ class ImageLocationConfigTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.kwargs["timeout"], 10)
         self.assertEqual(results, [("4600 SILVER HILL RD, WASHINGTON, DC, 20233", 38.846, -76.927)])
 
-    def test_lookup_confirmation_can_be_rejected(self):
-        answers = ["address", "1", self.location.SetupCancelled(), "", "39.5", "-77.4"]
+    def test_single_address_match_does_not_confirm_coordinates(self):
         with (
-            patch.object(self.location, "dialog", side_effect=answers),
+            patch.object(self.location, "dialog", return_value="address") as dialog,
             patch.object(self.location, "lookup_address", return_value=[("Matched", 38.8, -76.9)]) as lookup,
         ):
             result = self.location.choose_location()
         lookup.assert_called_once_with("address")
-        self.assertEqual(result, ("39.5", "-77.4"))
+        self.assertEqual(result, (38.8, -76.9))
+        dialog.assert_called_once()
 
     def test_address_prompt_explains_where_the_address_is_sent(self):
         with (
-            patch.object(self.location, "dialog", side_effect=["", "39", "-77"]) as dialog,
-            patch.object(self.location, "lookup_address") as lookup,
+            patch.object(self.location, "dialog", return_value="address") as dialog,
+            patch.object(self.location, "lookup_address", return_value=[("Matched", 39, -77)]),
         ):
-            self.assertEqual(self.location.choose_location(), ("39", "-77"))
+            self.assertEqual(self.location.choose_location(), (39, -77))
         prompt = dialog.call_args_list[0].args[1]
         self.assertIn("U.S. Census Bureau", prompt)
-        lookup.assert_not_called()
 
     def test_dialog_can_be_cancelled(self):
         result = subprocess.CompletedProcess(["whiptail"], 1, stderr="")
@@ -389,15 +388,20 @@ class ImageLocationConfigTests(unittest.TestCase):
             with self.assertRaises(self.location.SetupCancelled):
                 self.location.dialog("--inputbox", "Address", "10", "74")
 
-    def test_lookup_failure_and_no_match_allow_manual_entry(self):
+    def test_dialog_error_is_not_reported_as_cancellation(self):
+        result = subprocess.CompletedProcess(["whiptail"], 255, stderr="terminal too small")
+        with patch.object(self.location.subprocess, "run", return_value=result):
+            with self.assertRaisesRegex(OSError, "terminal too small"):
+                self.location.dialog("--inputbox", "Address", "10", "74")
+
+    def test_lookup_failure_and_no_match_allow_retry(self):
         for outcome in (OSError("Offline"), []):
             with (
                 self.subTest(outcome=outcome),
-                patch.object(self.location, "dialog", side_effect=["address", "", "", "39", "-77"]),
-                patch.object(self.location, "lookup_address", side_effect=outcome if isinstance(outcome, Exception) else None,
-                             return_value=outcome if isinstance(outcome, list) else None),
+                patch.object(self.location, "dialog", side_effect=["address", "", "retry"]),
+                patch.object(self.location, "lookup_address", side_effect=[outcome, [("Matched", 39, -77)]]),
             ):
-                self.assertEqual(self.location.choose_location(), ("39", "-77"))
+                self.assertEqual(self.location.choose_location(), (39, -77))
 
     def test_confirmed_address_saves_selected_coordinates(self):
         root = pathlib.Path(__file__).resolve().parent
@@ -406,7 +410,7 @@ class ImageLocationConfigTests(unittest.TestCase):
             settings.write_text((root / "ws-settings.ini.example").read_text())
             with (
                 patch.object(sys, "argv", ["configure-location.py", "--interactive", str(settings)]),
-                patch.object(self.location, "dialog", side_effect=["Station", "address", "2", ""]),
+                patch.object(self.location, "dialog", side_effect=["Station", "address", "2"]),
                 patch.object(self.location, "lookup_address", return_value=[
                     ("First", 1, 2), ("Second", 38.846, -76.927)
                 ]),
@@ -467,23 +471,31 @@ class ImageLocationConfigTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(settings.read_text(), original)
 
-    def test_setup_forms_save_features_general_and_map_settings(self):
+    def test_setup_preserves_map_and_osv_settings_and_sets_timezone(self):
         root = pathlib.Path(__file__).resolve().parent
         with tempfile.TemporaryDirectory() as directory:
             settings = pathlib.Path(directory) / "ws-settings.ini"
             settings.write_text(
                 "[LOCATION]\nNAME=Old\nLATITUDE=39\nLONGITUDE=-77\nMAP_LAT=40\n"
-                "[FEATURES]\nSUNTIME=false\n[GENERAL]\nDEPLOYMENT_ID=old\n"
+                "[FEATURES]\nSUNTIME=false\nOSV_COUNT=true\nOSV_TIDES=true\n[GENERAL]\nDEPLOYMENT_ID=old\n"
                 "SELF_UPDATE_INTERVAL_S=21600\n[OTHER]\nVALUE=keep\n"
             )
-            answers = [self.location.SetupCancelled(), "SUNTIME\nALT_PREDICTIONS", "site-1", "3600", "", "-76"]
-            with patch.object(self.location, "dialog", side_effect=answers):
+            answers = [self.location.SetupCancelled(), "SUNTIME\nALT_PREDICTIONS", "site-1", "3600"]
+            with (
+                patch.object(self.location, "dialog", side_effect=answers),
+                patch.object(self.location, "detect_timezone", return_value="America/New_York") as detect,
+                patch.object(self.location, "set_timezone") as set_zone,
+            ):
                 self.location.interactive_setup(str(settings))
+            detect.assert_called_once_with(39, -77)
+            set_zone.assert_called_once_with("America/New_York")
             config = ConfigParser()
             config.read(settings)
             self.assertEqual(config.get("LOCATION", "NAME"), "Old")
-            self.assertFalse(config.has_option("LOCATION", "MAP_LAT"))
-            self.assertEqual(config.getfloat("LOCATION", "MAP_LONG"), -76)
+            self.assertEqual(config.getfloat("LOCATION", "MAP_LAT"), 40)
+            self.assertFalse(config.has_option("LOCATION", "MAP_LONG"))
+            self.assertTrue(config.getboolean("FEATURES", "OSV_COUNT"))
+            self.assertTrue(config.getboolean("FEATURES", "OSV_TIDES"))
             self.assertTrue(config.getboolean("FEATURES", "SUNTIME"))
             self.assertTrue(config.getboolean("FEATURES", "ALT_PREDICTIONS"))
             self.assertFalse(config.getboolean("FEATURES", "POTOMAC"))
@@ -504,6 +516,46 @@ class ImageLocationConfigTests(unittest.TestCase):
                 self.location.interactive_setup(str(settings))
             self.assertEqual(settings.read_text(), original)
 
+    def test_timezone_failure_does_not_save_settings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            original = "[LOCATION]\nNAME=Old\nLATITUDE=39\nLONGITUDE=-77\n"
+            settings.write_text(original)
+            with (
+                patch.object(self.location, "dialog", side_effect=[
+                    self.location.SetupCancelled(), "", "", "21600",
+                ]),
+                patch.object(self.location, "detect_timezone", side_effect=OSError("Offline")),
+                self.assertRaisesRegex(OSError, "Time zone setup failed"),
+            ):
+                self.location.interactive_setup(str(settings))
+            self.assertEqual(settings.read_text(), original)
+
+    def test_timezone_lookup_and_passwordless_command(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"properties":{"timeZone":"America/New_York"}}'
+        with patch.object(self.location.urllib.request, "urlopen", return_value=response):
+            timezone = self.location.detect_timezone(39.1, -77.2)
+        with patch.object(self.location.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            self.location.set_timezone(timezone)
+        self.assertEqual(run.call_args.args[0], ["timedatectl", "--no-ask-password", "set-timezone", "America/New_York"])
+
+    def test_new_location_sets_its_timezone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            settings.write_text("[LOCATION]\n[FEATURES]\n[GENERAL]\n")
+            with (
+                patch.object(self.location, "interactive_location", return_value=("New", 47.6, -122.3)),
+                patch.object(self.location, "dialog", side_effect=["", "", "21600"]),
+                patch.object(self.location, "detect_timezone", return_value="America/Los_Angeles") as detect,
+                patch.object(self.location, "set_timezone") as set_zone,
+            ):
+                self.location.interactive_setup(str(settings))
+            detect.assert_called_once_with(47.6, -122.3)
+            set_zone.assert_called_once_with("America/Los_Angeles")
+            config = ConfigParser()
+            config.read(settings)
+            self.assertEqual(config.getfloat("LOCATION", "LONGITUDE"), -122.3)
 
 class ImageSetupTests(unittest.TestCase):
     def test_first_boot_session_focuses_setup_before_starting_desktop(self):
@@ -567,9 +619,17 @@ class ImageSetupTests(unittest.TestCase):
                 '*--checklist*) echo SUNTIME >&2 ;; esac\nexit 0\n'
             )
             whiptail.chmod(0o755)
+            (home / "configure-location.py").write_text(
+                (root / "image" / "configure-location.py").read_text().replace(
+                    "timezone = detect_timezone(lat, lon)", 'timezone = "America/New_York"'
+                )
+            )
+            timedatectl = home / "timedatectl"
+            timedatectl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" > "$HOME/timezone-command"\n')
+            timedatectl.chmod(0o755)
             setup = home / "weather-station-setup"
             setup.write_text((root / "image" / "weather-station-setup").read_text().replace(
-                "SHARE=/usr/local/share/weather-station", f'SHARE="{root / "image"}"'
+                "SHARE=/usr/local/share/weather-station", f'SHARE="{home}"'
             ))
             env = dict(os.environ, HOME=directory, PATH=f"{directory}:{os.environ['PATH']}")
             nmcli.write_text("#!/bin/sh\nprintf 'ethernet:connected\\nwifi:disconnected\\n'\n")
@@ -596,6 +656,8 @@ class ImageSetupTests(unittest.TestCase):
             config.read(settings)
             self.assertTrue(config.getboolean("FEATURES", "SUNTIME"))
             self.assertEqual(config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S"), 3600)
+            self.assertEqual((home / "timezone-command").read_text().strip(),
+                             "--no-ask-password set-timezone America/New_York")
 
 
 class CurrentTemperatureTests(unittest.TestCase):

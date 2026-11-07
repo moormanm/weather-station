@@ -4,12 +4,7 @@ set -euo pipefail
 MARKER="$HOME/.weather-station-setup-complete"
 [ -f "$MARKER" ] && exit 0
 
-printf '%s\n' \
-    "Welcome. Complete this setup before the weather station starts." \
-    "In Raspberry Pi Configuration, choose Localisation Options to set the" \
-    "time zone. Enter the pi password if asked."
-read -r -p "Press Enter to open Raspberry Pi Configuration. "
-sudo raspi-config
+printf '%s\n' "Welcome. Connect to Wi-Fi to set up the weather station."
 
 while true; do
     read -r -p "Press Enter to open Wi-Fi setup. "
@@ -21,6 +16,4 @@ while true; do
 done
 
 touch "$MARKER"
-printf '\nSetup is complete. The Pi will restart to apply the settings.\n'
-read -r -p "Press Enter to restart. "
-sudo reboot
+printf '\nSetup is complete. Starting the weather station.\n'

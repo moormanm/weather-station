@@ -95,7 +95,8 @@ On macOS, `_fullscreen_size()` reads the current display mode through CoreGraphi
   the OS. It checks the base-image checksum, caches Debian packages, and saves
   an uncompressed `.img` for Raspberry Pi Imager. The account is `pi/pi`,
   SSH is disabled, the keyboard uses the US layout, and the Wi-Fi country is
-  US. First boot prompts for time zone, Wi-Fi, and weather station location.
+  US. First boot prompts for Wi-Fi and station settings, and sets the time
+  zone from the station location.
   `weather-station-setup` requires connected Wi-Fi and configures
   `~/ws-settings.ini` with forms. The desktop shortcut and Ctrl+Alt+U run it again.
 - `./build-image.sh` uses pi-gen and Docker to create a 64-bit image for

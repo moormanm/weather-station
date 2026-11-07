@@ -5,6 +5,7 @@ HOME_DIR="/home/${FIRST_USER_NAME}"
 SHARE="${ROOTFS_DIR}/usr/local/share/weather-station"
 install -d "$SHARE" "${ROOTFS_DIR}/usr/local/bin" \
     "${ROOTFS_DIR}/usr/share/xsessions" "${ROOTFS_DIR}/etc/lightdm/lightdm.conf.d" \
+    "${ROOTFS_DIR}/etc/polkit-1/rules.d" \
     "${ROOTFS_DIR}/etc/default" \
     "${ROOTFS_DIR}${HOME_DIR}/Desktop" \
     "${ROOTFS_DIR}${HOME_DIR}/.config/pcmanfm/weather-station"
@@ -14,6 +15,17 @@ XKBLAYOUT="us"
 XKBVARIANT=""
 XKBOPTIONS=""
 BACKSPACE="guess"
+EOF
+cat > "${ROOTFS_DIR}/etc/polkit-1/rules.d/49-weather-station.rules" <<EOF
+polkit.addRule(function(action, subject) {
+    if (subject.user === "${FIRST_USER_NAME}" && subject.active && subject.local &&
+        (action.id === "org.freedesktop.timedate1.set-timezone" ||
+         action.id === "org.freedesktop.NetworkManager.network-control" ||
+         action.id === "org.freedesktop.NetworkManager.settings.modify.system" ||
+         action.id === "org.freedesktop.NetworkManager.settings.modify.own")) {
+        return polkit.Result.YES;
+    }
+});
 EOF
 if [ ! files/weather-station -ef "${ROOTFS_DIR}${HOME_DIR}/weather-station" ]; then
     cp -a files/weather-station "${ROOTFS_DIR}${HOME_DIR}/weather-station"

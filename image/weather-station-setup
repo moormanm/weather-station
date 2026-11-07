@@ -19,10 +19,6 @@ if ! grep -qx 'wifi:connected' <<< "$devices"; then
     exit 1
 fi
 
-if ! /usr/bin/python3 "$SHARE/configure-location.py" --setup "$SETTINGS"; then
-    whiptail --title "Weather Station Setup" --msgbox \
-        "Setup did not complete. Run setup again to retry." 10 74
-    exit 1
-fi
+/usr/bin/python3 "$SHARE/configure-location.py" --setup "$SETTINGS"
 whiptail --title "Weather Station Setup" --msgbox \
     "Settings saved. Restart the weather station to apply them." 10 74

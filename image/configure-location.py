@@ -104,7 +104,7 @@ def dialog(*arguments):
         ["whiptail", "--title", "Weather Station Setup", *arguments],
         stderr=subprocess.PIPE, text=True,
     )
-    if result.returncode in (1, 255):
+    if result.returncode == 1 or (result.returncode == 255 and not result.stderr.strip()):
         raise SetupCancelled
     if result.returncode != 0:
         raise OSError(f"Cannot open setup dialog: {result.stderr.strip()}")
@@ -116,37 +116,51 @@ def choose_location():
         address = dialog(
             "--inputbox",
             "Enter a U.S. street address, city, state, and ZIP.\n\n"
-            "The address will be sent to the U.S. Census Bureau.\n"
-            "Leave it blank to enter coordinates manually.",
+            "The address will be sent to the U.S. Census Bureau.",
             "14", "74",
         )
         if not address:
-            latitude = dialog("--inputbox", "Enter latitude (-90 to 90):", "10", "74")
-            longitude = dialog("--inputbox", "Enter longitude (-180 to 180):", "10", "74")
-            return latitude, longitude
+            dialog("--msgbox", "Enter a street address.", "10", "74")
+            continue
         try:
             results = lookup_address(address)
         except (OSError, ValueError, KeyError, TypeError) as error:
-            dialog("--msgbox", f"Address lookup failed: {error}\n\n"
-                   "Try again or leave the address blank to enter coordinates.", "12", "74")
+            dialog("--msgbox", f"Address lookup failed: {error}\n\nTry again.", "12", "74")
             continue
         if not results:
-            dialog("--msgbox", "No address matched. Try again or leave the address "
-                   "blank to enter coordinates.", "10", "74")
+            dialog("--msgbox", "No address matched. Try again.", "10", "74")
             continue
+        if len(results) == 1:
+            return results[0][1:]
         items = []
         for index, (matched, _, _) in enumerate(results, 1):
             items.extend((str(index), matched))
         selection = dialog("--menu", "Select the matching address:", "18", "74", "8", *items)
         if not selection.isdecimal() or not 1 <= int(selection) <= len(results):
             raise ValueError("The selected address is invalid.")
-        _, latitude, longitude = results[int(selection) - 1]
-        try:
-            dialog("--yesno", f"Use these approximate coordinates?\n\n"
-                   f"Latitude: {latitude}\nLongitude: {longitude}", "12", "74")
-            return latitude, longitude
-        except SetupCancelled:
-            continue
+        return results[int(selection) - 1][1:]
+
+
+def detect_timezone(latitude, longitude):
+    url = f"https://api.weather.gov/points/{latitude:.4f},{longitude:.4f}"
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "weather-station (https://github.com/moormanm/weather-station)"}
+    )
+    with urllib.request.urlopen(request, timeout=10) as response:
+        data = json.loads(response.read(1024 * 1024))
+    timezone = data["properties"]["timeZone"]
+    if not isinstance(timezone, str) or not re.fullmatch(r"[A-Za-z0-9_+-]+(?:/[A-Za-z0-9_+-]+)+", timezone):
+        raise ValueError("The weather service returned an invalid time zone.")
+    return timezone
+
+
+def set_timezone(timezone):
+    result = subprocess.run(
+        ["timedatectl", "--no-ask-password", "set-timezone", timezone],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise OSError(f"Cannot set time zone: {result.stderr.strip() or 'timedatectl failed'}")
 
 
 def interactive_location():
@@ -182,7 +196,7 @@ def interactive_setup(path):
         valid_location = False
     if valid_location:
         try:
-            dialog("--yesno", f"Current station: {name}\nLatitude: {lat}\nLongitude: {lon}\n\nChange location?", "13", "74")
+            dialog("--yesno", f"Current station: {name}\n\nChange location?", "10", "74")
         except SetupCancelled:
             pass
         else:
@@ -192,8 +206,6 @@ def interactive_setup(path):
         changes["LOCATION"] = {"NAME": name, "LATITUDE": str(lat), "LONGITUDE": str(lon)}
 
     features = [
-        ("OSV_COUNT", "OSV count", False),
-        ("OSV_TIDES", "OSV tides", False),
         ("COORDINATE_TIDES", "Nearest tide station", False),
         ("HOURLY_FORECAST", "Hourly forecast", True),
         ("HOURLY_PRECIP", "Hourly precipitation", config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True)),
@@ -222,17 +234,11 @@ def interactive_setup(path):
             break
         dialog("--msgbox", "Enter a whole number greater than zero.", "10", "74")
     changes["GENERAL"] = {"DEPLOYMENT_ID": deployment, "SELF_UPDATE_INTERVAL_S": interval}
-    for key, label, limit in (("MAP_LAT", "Map center latitude", 90), ("MAP_LONG", "Map center longitude", 180)):
-        while True:
-            value = dialog("--inputbox", f"{label} (optional; leave blank to use station location):",
-                           "11", "74", config.get("LOCATION", key, fallback=""))
-            try:
-                if value and (not math.isfinite(float(value)) or not -limit <= float(value) <= limit):
-                    raise ValueError
-                break
-            except ValueError:
-                dialog("--msgbox", f"Enter a value between -{limit} and {limit}, or leave it blank.", "10", "74")
-        changes.setdefault("LOCATION", {})[key] = value or None
+    try:
+        timezone = detect_timezone(lat, lon)
+        set_timezone(timezone)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise OSError(f"Time zone setup failed: {error}") from error
     update_settings(path, changes)
 
 
@@ -252,6 +258,17 @@ if __name__ == "__main__":
     try:
         main()
     except SetupCancelled:
-        sys.exit("Station setup cancelled.")
+        if "--setup" in sys.argv:
+            dialog("--msgbox", "Station setup was cancelled. No settings were saved.", "10", "74")
+        else:
+            print("Station setup cancelled.", file=sys.stderr)
+        sys.exit(2)
     except (Error, OSError, ValueError) as error:
-        sys.exit(f"Could not save location: {error}")
+        message = f"Station setup failed: {error}"
+        print(message, file=sys.stderr)
+        if "--setup" in sys.argv:
+            try:
+                dialog("--msgbox", message, "12", "74")
+            except (SetupCancelled, OSError):
+                pass
+        sys.exit(1)
