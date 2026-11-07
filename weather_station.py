@@ -2171,7 +2171,8 @@ def _fullscreen_size():
 def main():
     if sys.platform == "win32":
         os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
-    pygame.init()
+    pygame.display.init()
+    pygame.font.init()
     display = pygame.display.set_mode(_fullscreen_size(), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
     screen = _display_surface(display)
     pygame.mouse.set_visible(False)
