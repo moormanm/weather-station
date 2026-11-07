@@ -1,3 +1,3 @@
 xserver-xorg xinit lightdm openbox pcmanfm libfm-modules dbus-x11 lxpolkit
-network-manager xterm nano whiptail x11-xserver-utils
+network-manager xterm nano whiptail xdotool x11-xserver-utils
 python3-pygame fonts-dejavu-core librsvg2-common git

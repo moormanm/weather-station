@@ -506,6 +506,38 @@ class ImageLocationConfigTests(unittest.TestCase):
 
 
 class ImageSetupTests(unittest.TestCase):
+    def test_first_boot_session_focuses_setup_before_starting_desktop(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            commands = {
+                "xset": "exit 0",
+                "openbox": "exit 0",
+                "lxpolkit": "exit 0",
+                "xterm": 'while [ ! -f "$HOME/focused" ]; do sleep 0.05; done\n'
+                         'touch "$HOME/.weather-station-setup-complete"',
+                "xdotool": 'case "$1" in search) echo 123 ;; '
+                           'windowfocus) touch "$HOME/focused" ;; esac',
+                "pcmanfm": 'test -f "$HOME/focused" && touch "$HOME/desktop-started"',
+                "timeout": 'shift\nexec "$@"',
+            }
+            for name, body in commands.items():
+                command = home / name
+                command.write_text(f"#!/bin/sh\n{body}\n")
+                command.chmod(0o755)
+            session = (root / "image" / "weather-station-session").read_text().replace(
+                "/usr/local/bin/weather-station-launch", "true"
+            )
+            script = home / "session"
+            script.write_text(session)
+            env = dict(os.environ, HOME=directory, PATH=f"{directory}:{os.environ['PATH']}")
+            result = subprocess.run(
+                ["bash", str(script)], env=env, text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((home / "focused").exists())
+            self.assertTrue((home / "desktop-started").exists())
+
     def test_completed_first_boot_does_not_run_again(self):
         root = pathlib.Path(__file__).resolve().parent
         setup = root / "image" / "weather-station-first-boot"

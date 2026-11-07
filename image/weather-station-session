@@ -9,7 +9,27 @@ openbox --config-file /usr/local/share/weather-station/openbox.xml &
 lxpolkit &
 while [ ! -f "$HOME/.weather-station-setup-complete" ]; do
     xterm -name weather-station-first-boot -T "Weather Station First Boot Setup" \
-        -e /usr/local/bin/weather-station-first-boot || true
+        -e /usr/local/bin/weather-station-first-boot &
+    SETUP_PID=$!
+    focused=false
+    for attempt in $(seq 1 40); do
+        if ! kill -0 "$SETUP_PID" 2>/dev/null; then
+            break
+        fi
+        WINDOW="$(xdotool search --onlyvisible --pid "$SETUP_PID" \
+            --name '^Weather Station First Boot Setup$' 2>/dev/null | head -n 1 || true)"
+        if [ -n "$WINDOW" ] && \
+            timeout 1s xdotool windowactivate --sync "$WINDOW" && \
+            timeout 1s xdotool windowfocus --sync "$WINDOW"; then
+            focused=true
+            break
+        fi
+        sleep 0.25
+    done
+    if [ "$focused" = false ] && kill -0 "$SETUP_PID" 2>/dev/null; then
+        printf 'Could not focus the first-boot setup window.\n' >&2
+    fi
+    wait "$SETUP_PID" || true
 done
 pcmanfm --desktop --profile weather-station &
 DESKTOP_PID=$!
