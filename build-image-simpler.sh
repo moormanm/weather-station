@@ -16,7 +16,8 @@ and at least 15 GB of free Docker storage plus 10 GB of free host storage.
 Docker must support privileged Linux containers and loop-device mounts.
 
 Environment variables:
-  WS_IMAGE_SETTINGS    Settings file (default: ~/ws-settings.ini).
+  WS_IMAGE_SETTINGS    Optional base settings file (default: ~/ws-settings.ini,
+                       or the repository example if that file is absent).
   WS_IMAGE_WALLPAPER   Wallpaper file (default: image/wallpaper.svg).
   WS_IMAGE_REPOSITORY  Public HTTPS Git URL
                        (default: https://github.com/moormanm/weather-station.git).
@@ -29,13 +30,19 @@ The first build still needs internet access and time to install these packages.
 
 Output: .image-build/base-*/weather-station.img
 Select "Use custom" in Raspberry Pi Imager. Skip OS customisation.
-The image includes pi/pi, automatic login, US Wi-Fi, and disabled SSH.
-Press Q to show the desktop. It has shortcuts for settings, Wi-Fi, and the app.
+The image includes pi/pi, automatic login, and disabled SSH.
+The keyboard uses the US English layout and the Wi-Fi country is US.
+On first boot, configure the time zone, Wi-Fi, and station location.
+Look up a US street address online, or enter coordinates manually.
+Press Q to show the desktop. Use Weather Station Setup to run setup again.
+Setup requires an active Wi-Fi connection and opens all settings in nano.
 Use Ctrl+Alt+E to edit settings, Ctrl+Alt+W for Wi-Fi, or Ctrl+Alt+S to start.
+Use Ctrl+Alt+T to open a terminal or Ctrl+Alt+U to run setup again.
 The settings editor and Wi-Fi tool support keyboard input. The app starts
 without a Git request.
 
-Your settings are included in the output. Do not share personal settings or secrets.
+Any supplied settings are included in the output. Do not share personal
+settings or secrets.
 The app is cloned from GitHub; local uncommitted changes are not included.
 EOF
 }
@@ -61,15 +68,23 @@ if docker info --format '{{json .SecurityOptions}}' | grep -q rootless; then
     fail "This build needs rootful Docker with privileged containers."
 fi
 SETTINGS="${WS_IMAGE_SETTINGS:-$HOME/ws-settings.ini}"
+SETTINGS_IS_EXAMPLE=0
 WALLPAPER="${WS_IMAGE_WALLPAPER:-$ROOT/image/wallpaper.svg}"
 REPOSITORY="${WS_IMAGE_REPOSITORY:-https://github.com/moormanm/weather-station.git}"
 REF="${WS_IMAGE_REF:-main}"
-[ -f "$SETTINGS" ] || fail "Set WS_IMAGE_SETTINGS to a completed ws-settings.ini file."
+if [ -n "${WS_IMAGE_SETTINGS:-}" ]; then
+    [ -f "$SETTINGS" ] || fail "Settings file not found: $SETTINGS"
+elif [ ! -f "$SETTINGS" ]; then
+    SETTINGS="$ROOT/ws-settings.ini.example"
+    SETTINGS_IS_EXAMPLE=1
+fi
 [ -f "$WALLPAPER" ] || fail "Wallpaper file not found: $WALLPAPER"
 [[ "$REPOSITORY" == https://* ]] && [[ "$REPOSITORY" != *"@"* ]] ||
     fail "Use a public HTTPS Git URL without credentials."
 
-python3 "$ROOT/image/validate-settings.py" "$SETTINGS"
+if [ "$SETTINGS_IS_EXAMPLE" = 0 ]; then
+    python3 "$ROOT/image/validate-settings.py" "$SETTINGS"
+fi
 
 umask 077
 mkdir -p "$ROOT/.image-build/cache"
@@ -91,7 +106,8 @@ BUILD="$(mktemp -d "$ROOT/.image-build/base-XXXXXXXX")"
 mkdir "$BUILD/files"
 cp "$SETTINGS" "$BUILD/files/ws-settings.ini"
 cp "$WALLPAPER" "$BUILD/files/wallpaper"
-cp "$ROOT/image/"{weather-station-session,weather-station-launch,weather-station-settings,openbox.xml} \
+cp "$ROOT/image/"{weather-station-session,weather-station-launch,weather-station-settings,\
+weather-station-first-boot,weather-station-setup,configure-location.py,validate-settings.py,openbox.xml} \
     "$BUILD/files/"
 git clone --depth 1 --branch "$REF" --single-branch -- "$REPOSITORY" \
     "$BUILD/files/weather-station"

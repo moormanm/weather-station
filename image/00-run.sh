@@ -5,8 +5,16 @@ HOME_DIR="/home/${FIRST_USER_NAME}"
 SHARE="${ROOTFS_DIR}/usr/local/share/weather-station"
 install -d "$SHARE" "${ROOTFS_DIR}/usr/local/bin" \
     "${ROOTFS_DIR}/usr/share/xsessions" "${ROOTFS_DIR}/etc/lightdm/lightdm.conf.d" \
+    "${ROOTFS_DIR}/etc/default" \
     "${ROOTFS_DIR}${HOME_DIR}/Desktop" \
     "${ROOTFS_DIR}${HOME_DIR}/.config/pcmanfm/weather-station"
+cat > "${ROOTFS_DIR}/etc/default/keyboard" <<'EOF'
+XKBMODEL="pc105"
+XKBLAYOUT="us"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
 if [ ! files/weather-station -ef "${ROOTFS_DIR}${HOME_DIR}/weather-station" ]; then
     cp -a files/weather-station "${ROOTFS_DIR}${HOME_DIR}/weather-station"
 fi
@@ -15,8 +23,9 @@ if [ ! files/ws-settings.ini -ef "${ROOTFS_DIR}${HOME_DIR}/ws-settings.ini" ]; t
 fi
 install -m 644 files/wallpaper "$SHARE/wallpaper"
 install -m 644 files/openbox.xml "$SHARE/openbox.xml"
+install -m 644 files/configure-location.py files/validate-settings.py "$SHARE/"
 install -m 755 files/weather-station-session files/weather-station-launch \
-    files/weather-station-settings \
+    files/weather-station-settings files/weather-station-first-boot files/weather-station-setup \
     "${ROOTFS_DIR}/usr/local/bin/"
 
 cat > "${ROOTFS_DIR}/usr/share/xsessions/weather-station.desktop" <<'EOF'
@@ -59,6 +68,24 @@ Type=Application
 Name=Edit Weather Station Settings
 Exec=/usr/local/bin/weather-station-settings
 Icon=accessories-text-editor
+Terminal=false
+EOF
+
+cat > "${ROOTFS_DIR}${HOME_DIR}/Desktop/terminal.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Terminal
+Exec=xterm
+Icon=utilities-terminal
+Terminal=false
+EOF
+
+cat > "${ROOTFS_DIR}${HOME_DIR}/Desktop/setup.desktop" <<'EOF'
+[Desktop Entry]
+Type=Application
+Name=Weather Station Setup
+Exec=xterm -T "Weather Station Setup" -e /usr/local/bin/weather-station-setup
+Icon=preferences-system
 Terminal=false
 EOF
 chmod 755 "${ROOTFS_DIR}${HOME_DIR}/Desktop/"*.desktop

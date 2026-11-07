@@ -22,6 +22,16 @@
         <command>/usr/local/bin/weather-station-launch</command>
       </action>
     </keybind>
+    <keybind key="C-A-t">
+      <action name="Execute">
+        <command>xterm</command>
+      </action>
+    </keybind>
+    <keybind key="C-A-u">
+      <action name="Execute">
+        <command>xterm -T "Weather Station Setup" -e /usr/local/bin/weather-station-setup</command>
+      </action>
+    </keybind>
   </keyboard>
   <mouse>
     <context name="Titlebar">

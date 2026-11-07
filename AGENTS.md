@@ -94,7 +94,10 @@ On macOS, `_fullscreen_size()` reads the current display mode through CoreGraphi
   Docker. It adds the small X11 desktop, app, and settings without rebuilding
   the OS. It checks the base-image checksum, caches Debian packages, and saves
   an uncompressed `.img` for Raspberry Pi Imager. The account is `pi/pi`,
-  Wi-Fi country is US, and SSH is disabled.
+  SSH is disabled, the keyboard uses the US layout, and the Wi-Fi country is
+  US. First boot prompts for time zone, Wi-Fi, and weather station location.
+  `weather-station-setup` requires connected Wi-Fi and edits the complete
+  `~/ws-settings.ini` file. The desktop shortcut and Ctrl+Alt+U run it again.
 - `./build-image.sh` uses pi-gen and Docker to create a 64-bit image for
   Raspberry Pi Imager. It includes the app, settings, and maintenance desktop.
   The account is `pi/pi`, Wi-Fi country is US, and SSH is disabled.

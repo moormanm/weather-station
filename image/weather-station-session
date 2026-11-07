@@ -9,5 +9,8 @@ openbox --config-file /usr/local/share/weather-station/openbox.xml &
 lxpolkit &
 pcmanfm --desktop --profile weather-station &
 DESKTOP_PID=$!
+while [ ! -f "$HOME/.weather-station-setup-complete" ]; do
+    xterm -T "Weather Station First Boot Setup" -e /usr/local/bin/weather-station-first-boot || true
+done
 /usr/local/bin/weather-station-launch &
 wait "$DESKTOP_PID"

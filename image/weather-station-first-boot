@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MARKER="$HOME/.weather-station-setup-complete"
+[ -f "$MARKER" ] && exit 0
+
+printf '%s\n' \
+    "Welcome. Complete this setup before the weather station starts." \
+    "In Raspberry Pi Configuration, choose Localisation Options to set the" \
+    "time zone. Enter the pi password if asked."
+read -r -p "Press Enter to open Raspberry Pi Configuration. "
+sudo raspi-config
+
+while true; do
+    read -r -p "Press Enter to open Wi-Fi setup. "
+    nmtui
+    if /usr/local/bin/weather-station-setup; then
+        break
+    fi
+    printf 'Station setup did not complete. Check Wi-Fi and try again.\n'
+done
+
+touch "$MARKER"
+printf '\nSetup is complete. The Pi will restart to apply the settings.\n'
+read -r -p "Press Enter to restart. "
+sudo reboot

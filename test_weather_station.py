@@ -1,7 +1,12 @@
+import importlib.util
 import json
 import math
 import os
+import pathlib
 import runpy
+import subprocess
+import sys
+import tempfile
 import unittest
 from configparser import ConfigParser
 from unittest.mock import MagicMock, patch
@@ -330,6 +335,178 @@ class DisplayScalingTests(unittest.TestCase):
                 load.assert_not_called()
 
 
+class ImageLocationConfigTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        root = pathlib.Path(__file__).resolve().parent
+        spec = importlib.util.spec_from_file_location(
+            "configure_location", root / "image" / "configure-location.py"
+        )
+        cls.location = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.location)
+
+    def test_address_lookup_uses_census_and_returns_latitude_then_longitude(self):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps({
+            "result": {"addressMatches": [{
+                "matchedAddress": "4600 SILVER HILL RD, WASHINGTON, DC, 20233",
+                "coordinates": {"x": -76.927, "y": 38.846},
+            }]},
+        }).encode()
+        with patch.object(self.location.urllib.request, "urlopen", return_value=response) as fetch:
+            results = self.location.lookup_address("4600 Silver Hill Rd, Washington, DC 20233")
+        url = fetch.call_args.args[0]
+        self.assertTrue(url.startswith("https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?"))
+        params = self.location.urllib.parse.parse_qs(self.location.urllib.parse.urlsplit(url).query)
+        self.assertEqual(params["address"], ["4600 Silver Hill Rd, Washington, DC 20233"])
+        self.assertEqual(params["benchmark"], ["Public_AR_Current"])
+        self.assertEqual(fetch.call_args.kwargs["timeout"], 10)
+        self.assertEqual(results, [("4600 SILVER HILL RD, WASHINGTON, DC, 20233", 38.846, -76.927)])
+
+    def test_lookup_requires_consent_and_match_confirmation(self):
+        answers = ["a", "n", "a", "y", "address", "1", "n", "m", "39.5", "-77.4"]
+        with (
+            patch("builtins.input", side_effect=answers),
+            patch.object(self.location, "lookup_address", return_value=[("Matched", 38.8, -76.9)]) as lookup,
+        ):
+            result = self.location.choose_location()
+        lookup.assert_called_once_with("address")
+        self.assertEqual(result, ("39.5", "-77.4"))
+
+    def test_lookup_failure_and_no_match_allow_manual_entry(self):
+        for outcome in (OSError("Offline"), []):
+            with (
+                self.subTest(outcome=outcome),
+                patch("builtins.input", side_effect=["a", "y", "address", "m", "39", "-77"]),
+                patch.object(self.location, "lookup_address", side_effect=outcome if isinstance(outcome, Exception) else None,
+                             return_value=outcome if isinstance(outcome, list) else None),
+            ):
+                self.assertEqual(self.location.choose_location(), ("39", "-77"))
+
+    def test_confirmed_address_saves_selected_coordinates(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            settings.write_text((root / "ws-settings.ini.example").read_text())
+            with (
+                patch.object(sys, "argv", ["configure-location.py", "--interactive", str(settings)]),
+                patch("builtins.input", side_effect=["Station", "a", "y", "address", "2", "y"]),
+                patch.object(self.location, "lookup_address", return_value=[
+                    ("First", 1, 2), ("Second", 38.846, -76.927)
+                ]),
+            ):
+                self.location.main()
+            config = ConfigParser()
+            config.read(settings)
+            self.assertEqual(config.get("LOCATION", "NAME"), "Station")
+            self.assertEqual(config.getfloat("LOCATION", "LATITUDE"), 38.846)
+            self.assertEqual(config.getfloat("LOCATION", "LONGITUDE"), -76.927)
+
+    def test_location_is_saved_and_other_settings_are_kept(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            settings.write_text((root / "ws-settings.ini.example").read_text())
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(root / "image" / "configure-location.py"),
+                    str(settings),
+                    "Test Station",
+                    "39.5",
+                    "-77.4",
+                ],
+                check=True,
+            )
+            subprocess.run(
+                [sys.executable, str(root / "image" / "validate-settings.py"), str(settings)],
+                check=True,
+            )
+            config = ConfigParser()
+            config.read(settings)
+            self.assertEqual(config.get("LOCATION", "NAME"), "Test Station")
+            self.assertEqual(config.getfloat("LOCATION", "LATITUDE"), 39.5)
+            self.assertEqual(config.getfloat("LOCATION", "LONGITUDE"), -77.4)
+            self.assertFalse(config.getboolean("FEATURES", "SUNTIME"))
+            self.assertIn("# Use the nearest NOAA tide prediction station.", settings.read_text())
+
+    def test_invalid_location_does_not_change_settings(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            settings.write_text((root / "ws-settings.ini.example").read_text())
+            original = settings.read_text()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(root / "image" / "configure-location.py"),
+                    str(settings),
+                    "Test Station",
+                    "91",
+                    "-77.4",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(settings.read_text(), original)
+
+
+class ImageSetupTests(unittest.TestCase):
+    def test_completed_first_boot_does_not_run_again(self):
+        root = pathlib.Path(__file__).resolve().parent
+        setup = root / "image" / "weather-station-first-boot"
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            (home / ".weather-station-setup-complete").touch()
+            completed = subprocess.run(
+                ["bash", str(setup)], env=dict(os.environ, HOME=directory),
+                input="", text=True, capture_output=True,
+            )
+            self.assertEqual(completed.returncode, 0)
+            self.assertEqual(completed.stdout, "")
+            self.assertTrue((home / ".weather-station-setup-complete").exists())
+
+    def test_setup_requires_connected_wifi_and_opens_all_settings(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            settings = home / "ws-settings.ini"
+            original = "[LOCATION]\nNAME=Station\nLATITUDE=39\nLONGITUDE=-77\n[FEATURES]\nSUNTIME=false\n"
+            settings.write_text(original)
+            nmcli = home / "nmcli"
+            nano = home / "nano"
+            nano.write_text('#!/bin/sh\nprintf "\\n[EXTRA]\\nVALUE=changed\\n" >> "$1"\n')
+            nano.chmod(0o755)
+            setup = home / "weather-station-setup"
+            setup.write_text((root / "image" / "weather-station-setup").read_text().replace(
+                "SHARE=/usr/local/share/weather-station", f'SHARE="{root / "image"}"'
+            ))
+            env = dict(os.environ, HOME=directory, PATH=f"{directory}:{os.environ['PATH']}")
+            nmcli.write_text("#!/bin/sh\nprintf 'ethernet:connected\\nwifi:disconnected\\n'\n")
+            nmcli.chmod(0o755)
+            result = subprocess.run(
+                ["bash", str(setup)], env=env, input="", text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Connect to Wi-Fi", result.stderr)
+            self.assertEqual(settings.read_text(), original)
+            nmcli.write_text("#!/bin/sh\nexit 1\n")
+            result = subprocess.run(
+                ["bash", str(setup)], env=env, input="", text=True, capture_output=True
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Cannot check Wi-Fi", result.stderr)
+            self.assertEqual(settings.read_text(), original)
+            nmcli.write_text("#!/bin/sh\nprintf 'wifi:connected\\n'\n")
+            result = subprocess.run(
+                ["bash", str(setup)], env=env, input="n\n\n\n", text=True, capture_output=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[EXTRA]\nVALUE=changed", settings.read_text())
+            self.assertIn("Restart the weather station", result.stdout)
+
+
 class CurrentTemperatureTests(unittest.TestCase):
     def test_display_uses_open_meteo_temperature(self):
         class StopDrawing(Exception):
@@ -341,6 +518,7 @@ class CurrentTemperatureTests(unittest.TestCase):
         screen = MagicMock()
         screen.get_size.return_value = (1920, 1080)
         fonts = {key: MagicMock() for key in ("medium", "large", "small", "huge")}
+        fonts["huge"].render.return_value.get_height.return_value = 160
         with (
             patch.object(ws, "draw_text") as text,
             patch.object(ws, "draw_weather_icon") as icon,
@@ -353,7 +531,7 @@ class CurrentTemperatureTests(unittest.TestCase):
         clock = text.call_args_list[0]
         self.assertEqual(clock.args[4:], (1880, 40))
         self.assertEqual(clock.kwargs, {"anchor": "topright"})
-        self.assertEqual(icon.call_args.args[3], 155)
+        self.assertEqual(icon.call_args.args[3], 180)
 
     def test_left_widgets_use_the_space_below_the_raised_temperature(self):
         state = ws.AppState()
