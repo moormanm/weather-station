@@ -2247,7 +2247,7 @@ def main():
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()
-        clock.tick(10)
+        clock.tick(1)
         tick += 1
 
 
