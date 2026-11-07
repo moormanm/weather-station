@@ -648,6 +648,9 @@ class AppState:
         self.map_tiles = {}
         self.map_label_tiles = {}
         self.radar_tiles = {}
+        self._map_tile_surface_cache = {}
+        self._map_label_surface_cache = {}
+        self._radar_surface_cache = {}
         self.last_weather_upd = 0
         self.last_map_upd = 0
         self.backoff_until = 0
@@ -1222,6 +1225,27 @@ def _maybe_self_update_and_restart(repo_dir):
         return False
 
 
+def _cached_tile_surface(cache, key, blob, scale, alpha=None):
+    cached = cache.get(key)
+    if cached is not None:
+        cached_blob, cached_scale, cached_alpha, image = cached
+        if cached_scale == scale and cached_alpha == alpha:
+            if cached_blob is blob:
+                return image
+            if cached_blob == blob:
+                cache[key] = (blob, scale, alpha, image)
+                return image
+
+    image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
+    if scale != 1:
+        size = tuple(max(1, round(value * scale)) for value in image.get_size())
+        image = pygame.transform.smoothscale(image, size)
+    if alpha is not None:
+        image.set_alpha(alpha)
+    cache[key] = (blob, scale, alpha, image)
+    return image
+
+
 def draw_map(screen, state, fonts, mx, my, mw, mh):
     """Draw the map centered on MAP_LAT/MAP_LONG and the weather marker at LATITUDE/LONGITUDE."""
     if not state.map_tiles:
@@ -1258,25 +1282,30 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
     # Basemap: these tiles were selected using MAP_LAT/MAP_LONG.
     for (dx, dy), d in state.map_tiles.items():
         try:
-            img = pygame.image.load(io.BytesIO(d)).convert_alpha()
-            tile_surf.blit(img, tile_position(dx, dy))
+            img = _cached_tile_surface(
+                state._map_tile_surface_cache, (dx, dy), d, tile_surf.scale
+            )
+            tile_surf.surface.blit(img, tile_surf.point(tile_position(dx, dy)))
         except Exception:
             pass
 
     # Radar uses the same geographic tile positions as the basemap.
     for (dx, dy), blob in state.radar_tiles.items():
         try:
-            rd = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-            rd.set_alpha(180)
-            tile_surf.blit(rd, tile_position(dx, dy))
+            radar = _cached_tile_surface(
+                state._radar_surface_cache, (dx, dy), blob, tile_surf.scale, alpha=180
+            )
+            tile_surf.surface.blit(radar, tile_surf.point(tile_position(dx, dy)))
         except Exception as e:
             print(f"Radar draw error: {e}")
 
     # ArcGIS city/place-name reference layer.
     for (dx, dy), blob in state.map_label_tiles.items():
         try:
-            labels = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-            tile_surf.blit(labels, tile_position(dx, dy))
+            labels = _cached_tile_surface(
+                state._map_label_surface_cache, (dx, dy), blob, tile_surf.scale
+            )
+            tile_surf.surface.blit(labels, tile_surf.point(tile_position(dx, dy)))
         except Exception as e:
             print(f"Map label draw error: {e}")
 
