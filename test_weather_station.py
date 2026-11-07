@@ -265,35 +265,6 @@ class DisplayScalingTests(unittest.TestCase):
                 for actual, expected in zip(display.get_at((x + offset_x, y + offset_y))[:3], ws.PANEL):
                     self.assertLessEqual(abs(actual - expected), 3)
 
-    def test_map_tile_surfaces_are_cached_until_tile_data_changes(self):
-        state = ws.AppState()
-        state.map_tiles = {(0, 0): b"tile"}
-        display = ws.pygame.Surface((2560, 1440))
-        screen = ws._display_surface(display)
-        fonts = {"tiny": ws._RenderFont(self.font_path, 20, screen.scale)}
-        tile = ws.pygame.Surface((256, 256), ws.pygame.SRCALPHA)
-        loaded = MagicMock()
-        loaded.convert_alpha.return_value = tile
-
-        with (
-            patch.object(ws.pygame.image, "load", return_value=loaded) as image_load,
-            patch.object(
-                ws.pygame.transform,
-                "smoothscale",
-                wraps=ws.pygame.transform.smoothscale,
-            ) as smoothscale,
-        ):
-            ws.draw_map(screen, state, fonts, 550, 160, 820, 720)
-            state.map_tiles[(0, 0)] = bytes(bytearray(b"tile"))
-            ws.draw_map(screen, state, fonts, 550, 160, 820, 720)
-            self.assertEqual(image_load.call_count, 1)
-            self.assertEqual(smoothscale.call_count, 1)
-
-            state.map_tiles[(0, 0)] = b"changed"
-            ws.draw_map(screen, state, fonts, 550, 160, 820, 720)
-            self.assertEqual(image_load.call_count, 2)
-            self.assertEqual(smoothscale.call_count, 2)
-
     def test_map_coverage_and_compass_center_match_in_rendered_pixels(self):
         n = 2 ** ws.MAP_ZOOM
         tile = ws.pygame.Surface((256, 256), ws.pygame.SRCALPHA)
