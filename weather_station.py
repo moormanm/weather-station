@@ -2031,7 +2031,7 @@ def draw_screen(screen, state, fonts, tick):
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
             screen.blit(temp_surf, (60, 100))
             icon_x = 60 + temp_surf.get_width() + 18 + 65
-            draw_weather_icon(screen, cur["weather_code"], icon_x, 155, 130, GOLD)
+            draw_weather_icon(screen, cur["weather_code"], icon_x, 100 + temp_surf.get_height() // 2, 130, GOLD)
         else:
             bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
             if bootstrap_loading:
@@ -2054,7 +2054,7 @@ def draw_screen(screen, state, fonts, tick):
         if isinstance(screen, _RenderSurface):
             map_left = screen.point((map_draw_x, 0))[0]
             map_center_x = (map_left + round(768 * screen.scale) // 2) / screen.scale
-        draw_wind_widget(screen, state, fonts, map_center_x, my + mh + 6)
+        draw_wind_widget(screen, state, fonts, map_center_x, my + mh + 19)
 
         # 7-Day Forecast
         for i in range(7):
