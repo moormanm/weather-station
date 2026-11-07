@@ -335,6 +335,53 @@ class DisplayScalingTests(unittest.TestCase):
                 load.assert_not_called()
 
 
+class ScreenInvalidationTests(unittest.TestCase):
+    def test_redraw_is_skipped_until_state_or_display_time_changes(self):
+        state = ws.AppState()
+        state.started_at = 0
+        state.weather_loaded_once = True
+        state.motd_last_cycle = 100
+        state.screen_dirty = False
+        minute = "2026-11-07 15:00"
+
+        redraw, loading = ws._screen_redraw_due(state, 120, minute, minute, False)
+        self.assertFalse(redraw)
+        self.assertFalse(loading)
+
+        state.mark_screen_dirty()
+        redraw, _ = ws._screen_redraw_due(state, 120, minute, minute, False)
+        self.assertTrue(redraw)
+        redraw, _ = ws._screen_redraw_due(state, 120, minute, minute, False)
+        self.assertFalse(redraw)
+
+        redraw, _ = ws._screen_redraw_due(state, 120, "2026-11-07 15:01", minute, False)
+        self.assertTrue(redraw)
+        redraw, _ = ws._screen_redraw_due(state, 131, minute, minute, False)
+        self.assertTrue(redraw)
+
+    def test_update_completion_marks_screen_dirty(self):
+        state = ws.AppState()
+        state.screen_dirty = False
+
+        ws._run_update_task(state, "TEST", lambda: None)
+
+        self.assertTrue(state.screen_dirty)
+
+    def test_loading_window_start_and_end_trigger_redraws(self):
+        state = ws.AppState()
+        state.started_at = 100
+        state.motd_last_cycle = 180
+        state.screen_dirty = False
+
+        redraw, loading = ws._screen_redraw_due(state, 170, "minute", "minute", False)
+        self.assertTrue(redraw)
+        self.assertTrue(loading)
+
+        redraw, loading = ws._screen_redraw_due(state, 191, "minute", "minute", True)
+        self.assertTrue(redraw)
+        self.assertFalse(loading)
+
+
 class ImageLocationConfigTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -640,6 +640,7 @@ def _resolve_tide_station():
 class AppState:
     def __init__(self):
         self.started_at = time.time()
+        self.screen_dirty = True
         self.weather_loaded_once = False
         self.weather = None
         self.nws_hilo = {}              # {date_str: (hi_f, lo_f)} from NWS observed+forecast
@@ -695,6 +696,10 @@ class AppState:
                 self.runtime_error_source = None
                 self.runtime_error_message = None
                 self.runtime_error_at = 0
+
+    def mark_screen_dirty(self):
+        with self.lock:
+            self.screen_dirty = True
 
     # ── Weather ───────────────────────────────────────────────────────────────
     def update_weather(self):
@@ -1149,6 +1154,8 @@ def _run_update_task(state, source, fn, clear_on_success=True):
     except Exception as e:
         print(f"{source} update crash: {e}")
         state.set_runtime_error(source, f"{type(e).__name__}: {e}")
+    finally:
+        state.mark_screen_dirty()
 
 
 def _git_head(repo_dir):
@@ -2120,12 +2127,17 @@ def draw_screen(screen, state, fonts, tick):
         if not state.motd_pool or state.motd_index + 1 >= len(state.motd_pool):
             # Pool empty (fetch failed) or exhausted — request a fresh batch
             if not state._quotes_running:
-                threading.Thread(target=state.update_quotes, daemon=True).start()
+                threading.Thread(
+                    target=_run_update_task,
+                    args=(state, "QUOTES", state.update_quotes),
+                    daemon=True,
+                ).start()
             state.motd_last_cycle = now  # throttle: don't re-trigger next frame
         else:
             state.motd_index += 1
             state.motd = state.motd_pool[state.motd_index]
             state.motd_last_cycle = now
+            state.mark_screen_dirty()
 
 
 def _display_surface(display):
@@ -2166,6 +2178,22 @@ def _fullscreen_size():
         return (core.CGDisplayModeGetPixelWidth(mode), core.CGDisplayModeGetPixelHeight(mode))
     finally:
         core.CGDisplayModeRelease(mode)
+
+
+def _screen_redraw_due(state, now, minute_key, last_minute_key, last_bootstrap_loading):
+    with state.lock:
+        bootstrap_loading = (
+            not state.weather_loaded_once and now - state.started_at < 90
+        )
+        redraw = (
+            state.screen_dirty
+            or minute_key != last_minute_key
+            or bootstrap_loading != last_bootstrap_loading
+            or now - state.motd_last_cycle > 30
+        )
+        if redraw:
+            state.screen_dirty = False
+    return redraw, bootstrap_loading
 
 
 def main():
@@ -2217,6 +2245,8 @@ def main():
     if FEATURES["POTOMAC"]:   _spawn_delayed(7, "POTOMAC", state.update_potomac)
 
     clock, tick = pygame.time.Clock(), 0
+    last_minute_key = None
+    last_bootstrap_loading = None
     while True:
         for e in pygame.event.get():
             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_q):
@@ -2245,8 +2275,15 @@ def main():
             state.last_potomac_upd = now
             _spawn("POTOMAC", state.update_potomac)
 
-        draw_screen(screen, state, fonts, tick)
-        pygame.display.flip()
+        minute_key = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+        redraw, bootstrap_loading = _screen_redraw_due(
+            state, now, minute_key, last_minute_key, last_bootstrap_loading
+        )
+        if redraw:
+            draw_screen(screen, state, fonts, tick)
+            pygame.display.flip()
+            last_minute_key = minute_key
+            last_bootstrap_loading = bootstrap_loading
         clock.tick(1)
         tick += 1
 
