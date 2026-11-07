@@ -2054,7 +2054,7 @@ def draw_screen(screen, state, fonts, tick):
         if isinstance(screen, _RenderSurface):
             map_left = screen.point((map_draw_x, 0))[0]
             map_center_x = (map_left + round(768 * screen.scale) // 2) / screen.scale
-        draw_wind_widget(screen, state, fonts, map_center_x, my + mh + 66)
+        draw_wind_widget(screen, state, fonts, map_center_x, my + mh + 50)
 
         # 7-Day Forecast
         for i in range(7):
