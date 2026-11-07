@@ -18,11 +18,55 @@ import subprocess
 import random
 import re
 import io
+import copy
 from datetime import datetime
 
 
 from configparser import ConfigParser
 from pathlib import Path
+
+
+def _apply_deployment_settings(local_config):
+    deployment_id = local_config.get("GENERAL", "DEPLOYMENT_ID", fallback="").strip()
+    if not deployment_id:
+        return local_config
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", deployment_id):
+        print("Remote settings: DEPLOYMENT_ID must use letters, numbers, underscores, or hyphens.")
+        return local_config
+    url = (
+        "https://raw.githubusercontent.com/moormanm/weather-station/main/"
+        f"deployments/{deployment_id}.ini"
+    )
+    try:
+        with urllib.request.urlopen(url, timeout=5) as response:
+            data = response.read(65537)
+        if len(data) > 65536:
+            raise ValueError("The settings file exceeds 64 KiB.")
+        remote = ConfigParser()
+        remote.read_string(data.decode("utf-8-sig"))
+        if remote.has_option("GENERAL", "DEPLOYMENT_ID"):
+            remote.remove_option("GENERAL", "DEPLOYMENT_ID")
+        remote.defaults().pop("deployment_id", None)
+        merged = copy.deepcopy(local_config)
+        merged.read_dict(remote)
+        for key, limit in (("LATITUDE", 90), ("LONGITUDE", 180),
+                           ("MAP_LAT", 90), ("MAP_LONG", 180)):
+            value = merged.getfloat("LOCATION", key, fallback=None)
+            if value is not None and (not math.isfinite(value) or not -limit <= value <= limit):
+                raise ValueError(f"{key} must be between {-limit} and {limit}.")
+        if not merged.get("LOCATION", "NAME").strip():
+            raise ValueError("LOCATION NAME must not be empty.")
+        for key in ("OSV_COUNT", "OSV_TIDES", "COORDINATE_TIDES", "HOURLY_FORECAST",
+                    "HOURLY_PRECIP", "ALT_PREDICTIONS", "SUNTIME", "POTOMAC"):
+            merged.getboolean("FEATURES", key, fallback=False)
+        if merged.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=21600) <= 0:
+            raise ValueError("SELF_UPDATE_INTERVAL_S must be greater than zero.")
+    except Exception as error:
+        print(f"Remote settings: using local settings: {error}")
+        return local_config
+    print(f"Remote settings: applied deployment {deployment_id}.")
+    return merged
+
 
 config_path = Path("~/ws-settings.ini").expanduser()
 
@@ -32,6 +76,7 @@ if not config_path.exists():
 
 config = ConfigParser()
 config.read(config_path)
+config = _apply_deployment_settings(config)
 
 LATITUDE = config.getfloat("LOCATION", "LATITUDE")
 LONGITUDE = config.getfloat("LOCATION", "LONGITUDE")
@@ -45,7 +90,6 @@ FEATURES = {
     "OSV_COUNT":       config.getboolean("FEATURES", "OSV_COUNT",       fallback=False),
     "OSV_TIDES":       config.getboolean("FEATURES", "OSV_TIDES",       fallback=False),
     "COORDINATE_TIDES": config.getboolean("FEATURES", "COORDINATE_TIDES", fallback=False),
-    "RAM_PRICE":       config.getboolean("FEATURES", "RAM_PRICE",       fallback=False),
     "HOURLY_FORECAST": config.getboolean("FEATURES", "HOURLY_FORECAST", fallback=True),
     "HOURLY_PRECIP":   config.getboolean(
         "FEATURES",
@@ -55,12 +99,9 @@ FEATURES = {
     "ALT_PREDICTIONS": config.getboolean("FEATURES", "ALT_PREDICTIONS", fallback=False),
     "SUNTIME":         config.getboolean("FEATURES", "SUNTIME",         fallback=True),
     "POTOMAC":         config.getboolean("FEATURES", "POTOMAC",         fallback=False),
-    "NFLSTATS":        config.getboolean("FEATURES", "NFLSTATS",        fallback=False),
 }
 
-NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_section("NFLSTATS") else ""
-
-SCREEN_W, SCREEN_H = 1920, 1080
+SCREEN_W, SCREEN_H = 1920, 1080  # Logical layout size, not the display resolution.
 
 MAP_ZOOM = 7  # zoom level for both basemap and radar tiles (RainViewer max = 7)
 SELF_UPDATE_INTERVAL_S = config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=6 * 3600)
@@ -112,7 +153,6 @@ _NWS_ENDPOINTS_CACHE = {
 }
 TILE_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "weather_station_tiles")
 os.makedirs(TILE_CACHE_DIR, exist_ok=True)
-RAM_HISTORY_FILE = os.path.join(TILE_CACHE_DIR, "ram_price_history.json")
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 BG, PANEL = (10, 14, 26), (18, 24, 42)
@@ -171,6 +211,10 @@ def _draw_cloud_on(surf, cx, cy, size, color):
 def draw_weather_icon(surf, code, cx, cy, size, color):
     """Draw a detailed weather icon as pygame primitives.
     cx, cy = center; size = nominal half-width of bounding box."""
+    if isinstance(surf, _RenderSurface):
+        cx, cy = surf.point((cx, cy))
+        size = max(1, round(size * surf.scale))
+        surf = surf.surface
     kind  = WMO_ICON_TYPE.get(code, "sun")
     lw    = max(2, size // 20)
     small = size < 60
@@ -568,46 +612,6 @@ def _fetch_nws_hourly(forecast_url):
     ), "NWS"
 
 
-def _load_ram_history():
-    try:
-        with open(RAM_HISTORY_FILE, "r") as f:
-            return json.load(f).get("history", [])
-    except Exception:
-        return []
-
-def _save_ram_history(history):
-    try:
-        with open(RAM_HISTORY_FILE, "w") as f:
-            json.dump({"history": history}, f)
-    except Exception as e:
-        print(f"RAM history save error: {e}")
-
-def _fetch_ddr5_price():
-    """Scrape DRAM Exchange for DDR5 UDIMM 16GB 4800/5600 spot price and % change.
-    Returns (price_float, pct_change_float) or (None, None) on failure."""
-    raw = safe_fetch("https://www.dramexchange.com/", timeout=15)
-    if not raw or raw == "RATE_LIMITED":
-        return None, None
-    try:
-        html = raw.decode("utf-8", errors="replace")
-        # Find the DDR5 UDIMM 16GB row and grab the avg price and % change
-        m = re.search(
-            r'DDR5 UDIMM 16GB[^<]*</a>.*?'
-            r'<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>\s*'
-            r'<td[^>]*>([\d.]+)</td>\s*<td[^>]*>([\d.]+)</td>\s*'
-            r'<td[^>]*>([\d.]+)</td>.*?'
-            r'([-+]?[\d.]+)\s*%',
-            html, re.DOTALL
-        )
-        if m:
-            avg_price = float(m.group(5))
-            pct = float(m.group(6))
-            return avg_price, pct
-    except Exception as e:
-        print(f"DDR5 parse error: {e}")
-    return None, None
-
-
 def _resolve_tide_station():
     raw = safe_fetch(
         "https://api.tidesandcurrents.noaa.gov/mdapi/prod/webapi/stations.json?type=tidepredictions",
@@ -646,18 +650,12 @@ class AppState:
         self.radar_tiles = {}
         self.last_weather_upd = 0
         self.last_map_upd = 0
-        self.last_ram_upd = 0
         self.backoff_until = 0
         self.motd = "Loading..."
         self.motd_pool = []
         self.motd_index = 0
         self.motd_last_cycle = 0
         self._quotes_running = False
-        # RAM price state
-        self.ram_price = None           # current price
-        self.ram_pct = None             # % change from DRAM Exchange
-        self.ram_delta_24h = None       # dollar diff vs ~24h ago
-        self.ram_delta_7d = None        # dollar diff vs ~7d ago
         # Tide state
         self.tides = []              # list of {"t": "HH:MM", "v": float, "type": "H"/"L"} for today+tomorrow
         self.tide_station = None
@@ -675,15 +673,9 @@ class AppState:
         self.potomac_temp     = []   # list of (epoch_float, celsius_float)
         self.last_potomac_upd = 0
         self._potomac_running = False
-        # NFL standings state
-        self.nfl_nfc_north    = []    # list of standings rows for NFC North
-        self.nfl_season       = None
-        self.last_nfl_upd     = 0
-        self._nfl_running     = False
         self.lock = threading.Lock()
         self._weather_running = False
         self._map_running = False
-        self._ram_running = False
         self.runtime_error_source = None
         self.runtime_error_message = None
         self.runtime_error_at = 0
@@ -792,13 +784,16 @@ class AppState:
         zoom = MAP_ZOOM  # 7
         lat_rad = math.radians(MAP_LAT)
         n = 2 ** zoom
-        xt = int((MAP_LONG + 180.0) / 360.0 * n)
-        yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
+        tile_x = (MAP_LONG + 180.0) / 360.0 * n
+        tile_y = (1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n
+        xt, yt = math.floor(tile_x), math.floor(tile_y)
+        # Cover the full 768-pixel map around the exact geographic center.
+        columns = range(math.floor(tile_x - 1.5) - xt, math.ceil(tile_x + 1.5) - xt)
+        rows = range(math.floor(tile_y - 1.5) - yt, math.ceil(tile_y + 1.5) - yt)
 
-        # 3×3 basemap tiles at zoom 7
         new_tiles = {}
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
+        for dy in rows:
+            for dx in columns:
                 # ArcGIS World Imagery (Esri), using the standard XYZ tile scheme.
                 url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{yt+dy}/{xt+dx}"
                 fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
@@ -817,8 +812,8 @@ class AppState:
         # no city labels, so draw Esri's transparent reference layer over it.
         # This supplies city/town names while leaving the aerial imagery visible.
         new_label_tiles = {}
-        for dy in range(-1, 2):
-            for dx in range(-1, 2):
+        for dy in rows:
+            for dx in columns:
                 label_url = (
                     f"https://server.arcgisonline.com/ArcGIS/rest/services/"
                     f"Reference/World_Boundaries_and_Places/MapServer/tile/"
@@ -845,16 +840,15 @@ class AppState:
                 if label_data and label_data != "RATE_LIMITED":
                     new_label_tiles[(dx, dy)] = label_data
 
-        # Radar — fetch same 3×3 grid of zoom-7 tiles as basemap so all nearby
-        # precipitation is visible, not just what falls on the single center tile.
+        # Use the same coverage for the basemap, labels, and radar.
         new_radar_tiles = {}
         meta = safe_fetch("https://api.rainviewer.com/public/weather-maps.json")
         if meta and meta != "RATE_LIMITED":
             try:
                 rv = json.loads(meta.decode())
                 path, host = rv["radar"]["past"][-1]["path"], rv["host"]
-                for dy in range(-1, 2):
-                    for dx in range(-1, 2):
+                for dy in rows:
+                    for dx in columns:
                         radar_url = f"{host}{path}/256/{zoom}/{xt+dx}/{yt+dy}/6/1_1.png"
                         raw = safe_fetch(radar_url, timeout=10)
                         if raw and raw != "RATE_LIMITED":
@@ -871,57 +865,6 @@ class AppState:
             self.map_label_tiles = new_label_tiles
             self.radar_tiles = new_radar_tiles
             self.last_map_upd = time.time()
-
-    # ── RAM Price ─────────────────────────────────────────────────────────────
-    def update_ram(self):
-        if self._ram_running:
-            return
-        self._ram_running = True
-        try:
-            self._do_update_ram()
-        finally:
-            self._ram_running = False
-
-    def _do_update_ram(self):
-        price, pct = _fetch_ddr5_price()
-        if price is None:
-            print("RAM price fetch failed")
-            return
-        now = time.time()
-        history = _load_ram_history()
-
-        # Deduplicate by calendar date — keep only one entry per day (latest fetch)
-        today_str = datetime.now().strftime("%Y-%m-%d")
-        if history and datetime.fromtimestamp(history[-1]["ts"]).strftime("%Y-%m-%d") == today_str:
-            history[-1] = {"ts": now, "price": price}
-        else:
-            history.append({"ts": now, "price": price})
-
-        # Keep only last 10 days
-        cutoff = now - 10 * 86400
-        history = [e for e in history if e["ts"] >= cutoff]
-        _save_ram_history(history)
-
-        # Build date -> price map (latest entry per date wins)
-        by_date = {}
-        for e in history:
-            d = datetime.fromtimestamp(e["ts"]).strftime("%Y-%m-%d")
-            by_date[d] = e["price"]
-
-        from datetime import date as _date, timedelta as _timedelta
-        today = _date.today()
-        yesterday = (today - _timedelta(days=1)).isoformat()
-        week_ago  = (today - _timedelta(days=7)).isoformat()
-
-        delta_24h = (price - by_date[yesterday]) if yesterday in by_date else None
-        delta_7d  = (price - by_date[week_ago])  if week_ago  in by_date else None
-
-        with self.lock:
-            self.ram_price = price
-            self.ram_pct = pct
-            self.ram_delta_24h = delta_24h
-            self.ram_delta_7d = delta_7d
-            self.last_ram_upd = now
 
     # ── Quotes ────────────────────────────────────────────────────────────────
     def update_quotes(self):
@@ -1076,118 +1019,105 @@ class AppState:
         except Exception as e:
             print(f"Potomac parse error: {e}")
 
-    # ── NFL standings ────────────────────────────────────────────────────────
-    def update_nflstats(self):
-        if self._nfl_running:
-            return
-        self._nfl_running = True
-        try:
-            self._do_update_nflstats()
-        finally:
-            self._nfl_running = False
-
-    def _do_update_nflstats(self):
-        if not NFL_API_KEY:
-            return
-        now_dt = datetime.now()
-        season = now_dt.year if now_dt.month >= 9 else now_dt.year - 1
-        hdrs = {"Authorization": NFL_API_KEY, "User-Agent": USER_AGENT}
-        teams_url = "https://api.balldontlie.io/nfl/v1/teams?conference=NFC&division=NORTH"
-        all_games = []
-        try:
-            raw = safe_fetch(teams_url, timeout=20, headers=hdrs)
-            if not raw or raw == "RATE_LIMITED":
-                return
-            teams_data = json.loads(raw.decode()).get("data", [])
-            team_ids = [t.get("id") for t in teams_data if t.get("id")]
-            if not team_ids:
-                return
-
-            team_qs = "&".join(f"team_ids[]={tid}" for tid in team_ids)
-            url = f"https://api.balldontlie.io/nfl/v1/games?seasons[]={season}&postseason=false&per_page=100&{team_qs}"
-            cursor = None
-            while True:
-                page_url = url if cursor is None else f"{url}&cursor={cursor}"
-                raw = safe_fetch(page_url, timeout=20, headers=hdrs)
-                if not raw or raw == "RATE_LIMITED":
-                    break
-                data = json.loads(raw.decode())
-                all_games.extend(data.get("data", []))
-                cursor = (data.get("meta") or {}).get("next_cursor")
-                if not cursor:
-                    break
-
-            if not all_games:
-                return
-
-            teams = {}
-            for game in all_games:
-                if not str(game.get("status", "")).startswith("Final"):
-                    continue
-                home = game.get("home_team") or {}
-                away = game.get("visitor_team") or {}
-                for t in (home, away):
-                    if t.get("conference") != "NFC" or t.get("division") != "NORTH":
-                        continue
-                    teams.setdefault(t.get("abbreviation"), {
-                        "team": t,
-                        "wins": 0,
-                        "losses": 0,
-                        "ties": 0,
-                        "pf": 0,
-                        "pa": 0,
-                    })
-
-                if home.get("conference") == "NFC" and home.get("division") == "NORTH" and away.get("conference") == "NFC" and away.get("division") == "NORTH":
-                    home_score = int(game.get("home_team_score") or 0)
-                    away_score = int(game.get("visitor_team_score") or 0)
-                    for t, pf, pa in ((home, home_score, away_score), (away, away_score, home_score)):
-                        row = teams[t.get("abbreviation")]
-                        row["pf"] += pf
-                        row["pa"] += pa
-                    if home_score > away_score:
-                        teams[home.get("abbreviation")]["wins"] += 1
-                        teams[away.get("abbreviation")]["losses"] += 1
-                    elif away_score > home_score:
-                        teams[away.get("abbreviation")]["wins"] += 1
-                        teams[home.get("abbreviation")]["losses"] += 1
-                    else:
-                        teams[home.get("abbreviation")]["ties"] += 1
-                        teams[away.get("abbreviation")]["ties"] += 1
-                else:
-                    # Only count games against NFC North opponents.
-                    for side, opp_side in ((home, away), (away, home)):
-                        if side.get("conference") != "NFC" or side.get("division") != "NORTH":
-                            continue
-                        score = int(game.get("home_team_score") if side is home else game.get("visitor_team_score") or 0)
-                        opp_score = int(game.get("visitor_team_score") if side is home else game.get("home_team_score") or 0)
-                        row = teams[side.get("abbreviation")]
-                        row["pf"] += score
-                        row["pa"] += opp_score
-                        if score > opp_score:
-                            row["wins"] += 1
-                        elif score < opp_score:
-                            row["losses"] += 1
-                        else:
-                            row["ties"] += 1
-
-            rows = []
-            for row in teams.values():
-                gp = row["wins"] + row["losses"] + row["ties"]
-                row["overall_record"] = f"{row['wins']}-{row['losses']}-{row['ties']}"
-                row["point_differential"] = row["pf"] - row["pa"]
-                row["games_played"] = gp
-                rows.append(row)
-
-            rows.sort(key=lambda r: (-r["wins"], r["losses"], -r["point_differential"], r["team"]["full_name"]))
-            with self.lock:
-                self.nfl_nfc_north = rows
-                self.nfl_season = season
-                self.last_nfl_upd = time.time()
-        except Exception as e:
-            print(f"NFL standings parse error: {e}")
-
 # ── UI Rendering ──────────────────────────────────────────────────────────────
+class _RenderSurface:
+    """Keep layout coordinates while drawing directly at display resolution."""
+
+    def __init__(self, surface, size):
+        self.surface = surface
+        self.size = size
+        self.scale = surface.get_width() / size[0]
+
+    def get_size(self):
+        return self.size
+
+    def get_width(self):
+        return self.size[0]
+
+    def get_height(self):
+        return self.size[1]
+
+    def get_rect(self, **kwargs):
+        rect = pygame.Rect((0, 0), self.size)
+        for key, value in kwargs.items():
+            setattr(rect, key, value)
+        return rect
+
+    def point(self, point):
+        return tuple(round(value * self.scale) for value in point)
+
+    def child(self, size):
+        pixels = tuple(max(1, round(value * self.scale)) for value in size)
+        return _RenderSurface(pygame.Surface(pixels, pygame.SRCALPHA), size)
+
+    def fill(self, color):
+        self.surface.fill(color)
+
+    def blit(self, image, dest, special_flags=0):
+        position = self.point(dest[:2])
+        if isinstance(image, _RenderSurface):
+            image = image.surface
+        else:
+            size = tuple(max(1, round(value * self.scale)) for value in image.get_size())
+            if size != image.get_size():
+                image = pygame.transform.smoothscale(image, size)
+        self.surface.blit(image, position, special_flags=special_flags)
+
+
+class _RenderFont:
+    def __init__(self, path, size, scale):
+        self.font = pygame.font.Font(path, max(1, round(size * scale)))
+        self.scale = scale
+
+    def render(self, text, antialias, color):
+        image = self.font.render(text, antialias, color)
+        size = tuple(max(1, round(value / self.scale)) for value in image.get_size())
+        return _RenderSurface(image, size)
+
+
+class _Draw:
+    @staticmethod
+    def rect(surface, color, rect, width=0, border_radius=0):
+        if isinstance(surface, _RenderSurface):
+            rect = pygame.Rect(rect)
+            rect = (*surface.point(rect.topleft), *surface.point(rect.size))
+            width = max(1, round(width * surface.scale)) if width else 0
+            border_radius = round(border_radius * surface.scale)
+            surface = surface.surface
+        return pygame.draw.rect(surface, color, rect, width, border_radius=border_radius)
+
+    @staticmethod
+    def circle(surface, color, center, radius, width=0):
+        if isinstance(surface, _RenderSurface):
+            center = surface.point(center)
+            radius = max(1, round(radius * surface.scale))
+            width = max(1, round(width * surface.scale)) if width else 0
+            surface = surface.surface
+        return pygame.draw.circle(surface, color, center, radius, width)
+
+    @staticmethod
+    def line(surface, color, start, end, width=1):
+        if isinstance(surface, _RenderSurface):
+            start, end = surface.point(start), surface.point(end)
+            width = max(1, round(width * surface.scale))
+            surface = surface.surface
+        return pygame.draw.line(surface, color, start, end, width)
+
+    @staticmethod
+    def lines(surface, color, closed, points, width=1):
+        if isinstance(surface, _RenderSurface):
+            points = [surface.point(point) for point in points]
+            width = max(1, round(width * surface.scale))
+            surface = surface.surface
+        return pygame.draw.lines(surface, color, closed, points, width)
+
+
+def _render_child(surface, size):
+    if isinstance(surface, _RenderSurface):
+        return surface.child(size)
+    return pygame.Surface(size, pygame.SRCALPHA)
+
+
 def draw_text(surf, text, font, color, x, y, anchor="topleft"):
     img = font.render(str(text), True, color)
     surf.blit(img, img.get_rect(**{anchor: (x, y)}))
@@ -1206,8 +1136,8 @@ def draw_error_banner(screen, fonts, W, H, source, message):
     box_x = (W - box_w) // 2
     box_y = H - 84
     rect = pygame.Rect(box_x, box_y, box_w, box_h)
-    pygame.draw.rect(screen, (88, 20, 20), rect, border_radius=8)
-    pygame.draw.rect(screen, RED, rect, 1, border_radius=8)
+    _Draw.rect(screen, (88, 20, 20), rect, border_radius=8)
+    _Draw.rect(screen, RED, rect, 1, border_radius=8)
     draw_text(screen, label, fonts["tiny"], (255, 230, 230), box_x + 10, box_y + box_h // 2, anchor="midleft")
 
 
@@ -1309,13 +1239,13 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
         math.tan(map_lat_rad) + 1 / math.cos(map_lat_rad)
     ) / math.pi) / 2.0 * n * TILE
 
-    # The downloaded 3x3 grid is indexed relative to the tile containing
+    # The downloaded grid is indexed relative to the tile containing
     # MAP_LAT/MAP_LONG.  Shift every tile by the fractional position of the
     # exact map center so that MAP_LAT/MAP_LONG is precisely at (384,384).
     center_xt = int(map_world_x // TILE)
     center_yt = int(map_world_y // TILE)
 
-    tile_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
+    tile_surf = _render_child(screen, (768, 768))
     tile_ox = (mw - 768) // 2
     tile_oy = (mh - 768) // 2
 
@@ -1367,9 +1297,9 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
     dot_x = int(round(384.0 + weather_world_x - map_world_x))
     dot_y = int(round(384.0 + weather_world_y - map_world_y))
 
-    pygame.draw.circle(tile_surf, (0, 0, 0), (dot_x, dot_y), 8)
-    pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
-    pygame.draw.circle(tile_surf, (255, 255, 255), (dot_x, dot_y), 2)
+    _Draw.circle(tile_surf, (0, 0, 0), (dot_x, dot_y), 8)
+    _Draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
+    _Draw.circle(tile_surf, (255, 255, 255), (dot_x, dot_y), 2)
 
     # LOCATION_NAME is anchored to the exact LATITUDE/LONGITUDE marker.
     label_font = fonts["tiny"]
@@ -1384,14 +1314,14 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
     label_x = max(6, min(label_x, 768 - label_box_w - 6))
     label_y = max(6, min(label_y, 768 - label_box_h - 6))
     label_box = pygame.Rect(label_x, label_y, label_box_w, label_box_h)
-    pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
-    pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
+    _Draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
+    _Draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
     tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
 
     # Rounded clipping mask.
-    mask_surf = pygame.Surface((768, 768), pygame.SRCALPHA)
+    mask_surf = _render_child(screen, (768, 768))
     mask_surf.fill((0, 0, 0, 0))
-    pygame.draw.rect(mask_surf, (255, 255, 255, 255), (0, 0, 768, 768), border_radius=16)
+    _Draw.rect(mask_surf, (255, 255, 255, 255), (0, 0, 768, 768), border_radius=16)
     tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
     screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
@@ -1429,12 +1359,12 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
         widget_w += 1
     widget_h = (RADIUS * 2) + 42
 
-    ws = pygame.Surface((widget_w, widget_h), pygame.SRCALPHA)
+    ws = _render_child(screen, (widget_w, widget_h))
     wcx = widget_w // 2
     wcy = RADIUS + 1
 
-    pygame.draw.circle(ws, PANEL, (wcx, wcy), RADIUS)
-    pygame.draw.circle(ws, TEXT_DIM, (wcx, wcy), RADIUS, 1)
+    _Draw.circle(ws, PANEL, (wcx, wcy), RADIUS)
+    _Draw.circle(ws, TEXT_DIM, (wcx, wcy), RADIUS, 1)
 
     # Cardinal labels — placed just inside the rim
     for label, sx, sy in (("N", 0, -1), ("S", 0, 1), ("E", 1, 0), ("W", -1, 0)):
@@ -1456,10 +1386,10 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
         tail_x = wcx - int(arrow_len * math.sin(from_rad))
         tail_y = wcy + int(arrow_len * math.cos(from_rad))
 
-        pygame.draw.line(ws, ACCENT, (tail_x, tail_y), (tip_x, tip_y), 2)
+        _Draw.line(ws, ACCENT, (tail_x, tail_y), (tip_x, tip_y), 2)
         for side in (+1, -1):
             wing_rad = from_rad + side * math.radians(145)
-            pygame.draw.line(ws, ACCENT, (tip_x, tip_y),
+            _Draw.line(ws, ACCENT, (tip_x, tip_y),
                              (tip_x + int(head_len * math.sin(wing_rad)),
                               tip_y - int(head_len * math.cos(wing_rad))), 2)
 
@@ -1467,7 +1397,12 @@ def draw_wind_widget(screen, state, fonts, cx, cy):
     if line2_img:
         ws.blit(line2_img, line2_img.get_rect(center=(wcx, wcy + RADIUS + 26)))
 
-    screen.blit(ws, (cx - widget_w // 2, cy - wcy))
+    if isinstance(screen, _RenderSurface):
+        target_x, target_y = screen.point((cx, cy))
+        center_x, center_y = ws.point((wcx, wcy))
+        screen.surface.blit(ws.surface, (target_x - center_x, target_y - center_y))
+    else:
+        screen.blit(ws, (cx - widget_w // 2, cy - wcy))
 
 
 def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
@@ -1492,7 +1427,7 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
     graph_h = h - 26
 
     # Background panel
-    pygame.draw.rect(screen, PANEL, (graph_x, graph_y, graph_w, graph_h), border_radius=10)
+    _Draw.rect(screen, PANEL, (graph_x, graph_y, graph_w, graph_h), border_radius=10)
 
     def _minutes(t_str):
         # t_str: "YYYY-MM-DD HH:MM"  — convert to minutes since today midnight
@@ -1521,7 +1456,7 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
     # Gridlines at 6-hour marks
     for hr in range(0, 25, 6):
         gx = graph_x + int(hr / 24 * graph_w)
-        pygame.draw.line(screen, BG, (gx, graph_y + 4), (gx, graph_y + graph_h - 22), 1)
+        _Draw.line(screen, BG, (gx, graph_y + 4), (gx, graph_y + graph_h - 22), 1)
         label = f"{hr % 12 or 12}{'a' if hr < 12 else 'p'}"
         draw_text(screen, label, fonts["tiny"], TEXT_DIM, gx, graph_y + graph_h - 20, anchor="midtop")
 
@@ -1545,7 +1480,7 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
             poly.append((ppx, ppy))
 
     if len(poly) >= 2:
-        pygame.draw.lines(screen, ACCENT, False, poly, 2)
+        _Draw.lines(screen, ACCENT, False, poly, 2)
 
     # Mark only today's hi/lo events — one combined label each
     today_tides = [t for t in sorted_tides if 0 <= _minutes(t["t"]) < 1440]
@@ -1555,7 +1490,7 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
         px, py = _px(m, n)
         is_high = t["type"] == "H"
         color = TEXT_BRIGHT if is_high else RAIN
-        pygame.draw.circle(screen, color, (px, py), 5)
+        _Draw.circle(screen, color, (px, py), 5)
         # e.g. "H 3.2ft 10:24a"
         t_hm   = t["t"].split(" ")[1]
         hh, mm = int(t_hm.split(":")[0]), int(t_hm.split(":")[1])
@@ -1569,7 +1504,7 @@ def draw_tide_widget(screen, state, fonts, x, y, w=480, h=230):
     # Now-marker
     now_min = datetime.now().hour * 60 + datetime.now().minute
     nx = graph_x + int(now_min / 1440 * graph_w)
-    pygame.draw.line(screen, GOLD, (nx, graph_y + 4), (nx, graph_y + graph_h - 22), 2)
+    _Draw.line(screen, GOLD, (nx, graph_y + 4), (nx, graph_y + graph_h - 22), 2)
 
 
 def draw_osv_widget(screen, state, fonts, x, y, w=480):
@@ -1594,10 +1529,10 @@ def draw_osv_widget(screen, state, fonts, x, y, w=480):
     # Fill bar
     fill_frac = min(osv_count / osv_max, 1.0)
     fill_color = GREEN if fill_frac < 0.7 else (GOLD if fill_frac < 0.9 else RED)
-    pygame.draw.rect(screen, PANEL, (bar_x, bar_y, bar_w, bar_h), border_radius=6)
+    _Draw.rect(screen, PANEL, (bar_x, bar_y, bar_w, bar_h), border_radius=6)
     if fill_frac > 0:
-        pygame.draw.rect(screen, fill_color, (bar_x, bar_y, int(bar_w * fill_frac), bar_h), border_radius=6)
-    pygame.draw.rect(screen, TEXT_DIM, (bar_x, bar_y, bar_w, bar_h), 1, border_radius=6)
+        _Draw.rect(screen, fill_color, (bar_x, bar_y, int(bar_w * fill_frac), bar_h), border_radius=6)
+    _Draw.rect(screen, TEXT_DIM, (bar_x, bar_y, bar_w, bar_h), 1, border_radius=6)
 
     # Count / max text — vertically centered in bar
     draw_text(screen, f"{osv_count} / {osv_max}", fonts["small"], TEXT_BRIGHT, x + bar_w // 2, bar_y + bar_h // 2, anchor="center")
@@ -1614,78 +1549,15 @@ def draw_osv_widget(screen, state, fonts, x, y, w=480):
         draw_text(screen, f"as of {ts_str}", fonts["tiny"], TEXT_DIM, x + w, bar_y + bar_h + 8, anchor="topright")
 
 
-def draw_ram_widget(screen, state, fonts, x, y):
-    """Draw the DDR5 RAM price ticker in the bottom-left area.
-      y +  0 : "DDR5 16GB 4800/5600  (spot)"   [tiny, dim]
-      y + 22 : "$218.50"                        [large, bright]
-      y + 95 : "24h -$1.25    7d -$4.00"        [small, colored]
-    """
-    draw_text(screen, "DDR5 16GB spot price", fonts["tiny"], TEXT_DIM, x, y)
-
-    if state.ram_price is None:
-        draw_text(screen, "Loading...", fonts["small"], TEXT_DIM, x, y + 28)
-        return
-
-    draw_text(screen, f"${state.ram_price:.2f}", fonts["large"], TEXT_BRIGHT, x, y + 22)
-
-    def delta_str(delta):
-        if delta is None:
-            return "--", TEXT_DIM
-        col = GREEN if delta <= 0 else RED
-        sign = "-" if delta < 0 else "+"
-        return f"{sign}${abs(delta):.2f}", col
-
-    d24_str, d24_col = delta_str(state.ram_delta_24h)
-    d7d_str, d7d_col = delta_str(state.ram_delta_7d)
-
-    draw_text(screen, "24h", fonts["tiny"],    TEXT_DIM, x,       y + 97)
-    draw_text(screen, d24_str, fonts["small"], d24_col,  x + 38,  y + 93)
-    draw_text(screen, "7d",  fonts["tiny"],    TEXT_DIM, x + 160, y + 97)
-    draw_text(screen, d7d_str, fonts["small"], d7d_col,  x + 190, y + 93)
-
-
-def draw_nflstats_widget(screen, state, fonts, x, y, w=440, h=200):
-    """Compact NFC North standings widget."""
-    TITLE_H = 24
-    min_panel_h = 14 + (24 * 4) + 8
-    panel_y = y + TITLE_H
-    panel_h = max(h - TITLE_H, min_panel_h)
-    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
-
-    rows = state.nfl_nfc_north
-    if not rows:
-        draw_text(screen, "Loading NFC North...", fonts["small"], TEXT_DIM,
-                  x + w // 2, panel_y + panel_h // 2, anchor="center")
-        return
-
-    title = f"NFC North standings" + (f"  {state.nfl_season}" if state.nfl_season else "")
-    draw_text(screen, title, fonts["tiny"], TEXT_DIM, x, y + 4)
-
-    row_y = panel_y + 14
-    row_step = 24
-    for row in rows:
-        team = row.get("team") or {}
-        full_name = team.get("full_name", "")
-        wl = row.get("overall_record", "0-0")
-        is_gb = full_name == "Green Bay Packers"
-        row_color = TEXT_BRIGHT if is_gb else TEXT_DIM
-        if is_gb:
-            pygame.draw.rect(screen, (30, 56, 34), (x + 6, row_y - 2, w - 12, 22), border_radius=6)
-        draw_text(screen, full_name, fonts["tiny"], row_color, x + 14, row_y)
-        draw_text(screen, wl, fonts["tiny"], row_color, x + w - 14, row_y, anchor="topright")
-        row_y += row_step
-
-
-
 # ── Left-column layout engine ─────────────────────────────────────────────────
 # The zone below the current-temp / icon block is divided dynamically among
 # whichever features are enabled.  "Growable" widgets (chart types) expand
 # equally to absorb remaining space, capped at _COL_MAX_H each.
 
-_COL_X        = 60    # x for text-only widgets (SUNTIME title row, RAM labels)
+_COL_X        = 60    # x for text-only widgets (SUNTIME title row)
 _COL_WIDGET_X = 80    # x for chart / bar widgets
 _COL_W        = 440   # width for chart / bar widgets  (right edge at x = 520)
-_COL_Y_TOP    = 350   # top of dynamic zone (just below current-temp / icon block)
+_COL_Y_TOP    = 310   # top of dynamic zone (just below current-temp / icon block)
 _COL_Y_BOT    = 1000  # bottom of dynamic zone (above MOTD bar)
 _COL_MAX_GAP  = 40    # maximum gap between adjacent widgets (actual gap is computed dynamically)
 _COL_MAX_H    = 400   # maximum height a growable widget may reach
@@ -1700,8 +1572,6 @@ _COL_CATALOG = [
     ("HOURLY_FORECAST", 150,  True),
     ("HOURLY_PRECIP",   150,  True),
     ("POTOMAC",         120,  True),
-    ("NFLSTATS",        168,  False),
-    ("RAM_PRICE",       128,  False),
 ]
 
 
@@ -1799,7 +1669,7 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
 
     panel_y = y + TITLE_H
     panel_h = h - TITLE_H
-    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+    _Draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
     draw_text(screen, "Next 8 Hours Temp", fonts["tiny"], TEXT_DIM, x, y + 4)
 
     hourly = (state.weather or {}).get("hourly", {})
@@ -1847,28 +1717,28 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         return chart_y + chart_h - int((v - t_lo) / t_rng * chart_h)
 
     for i in range(n):
-        pygame.draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
+        _Draw.line(screen, BG, (_cx(i), chart_y), (_cx(i), chart_y + chart_h), 1)
     for frac in (0.0, 0.5, 1.0):
         gy = chart_y + int(chart_h * frac)
-        pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
+        _Draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
     om_pts = [(_cx(i), _ty(s_temps[i])) for i in range(n)]
     if len(om_pts) >= 2:
-        pygame.draw.lines(screen, ACCENT, False, om_pts, 2)
+        _Draw.lines(screen, ACCENT, False, om_pts, 2)
 
     nws_idx = {t: v for t, v in zip(nws_times, nws_temps)}
     if show_alt and len(nws_times) >= 2:
         nws_pts = [(_cx(i), _ty(nws_idx[t])) for i, t in enumerate(s_times) if t in nws_idx]
         if len(nws_pts) >= 2:
-            pygame.draw.lines(screen, GOLD, False, nws_pts, 2)
+            _Draw.lines(screen, GOLD, False, nws_pts, 2)
 
     for i, (px, om_py) in enumerate(om_pts):
-        pygame.draw.circle(screen, ACCENT, (px, om_py), 4 if i == 0 else 3)
+        _Draw.circle(screen, ACCENT, (px, om_py), 4 if i == 0 else 3)
 
         has_nws = s_times[i] in nws_idx
         nws_py = _ty(nws_idx[s_times[i]]) if has_nws else None
         if show_alt and has_nws:
-            pygame.draw.circle(screen, GOLD, (px, nws_py), 4 if i == 0 else 3)
+            _Draw.circle(screen, GOLD, (px, nws_py), 4 if i == 0 else 3)
 
         om_lbl = f"{round(s_temps[i])}\u00b0"
         if show_alt and has_nws:
@@ -1906,9 +1776,9 @@ def draw_hourly_widget(screen, state, fonts, x, y, w=440, h=200):
         legend_x = x + 300
         legend_y = y + 20
         legend_gap = 24
-        pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+        _Draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
         draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
-        pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+        _Draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
         draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
 
 
@@ -1922,7 +1792,7 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
 
     panel_y = y + TITLE_H
     panel_h = h - TITLE_H
-    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+    _Draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
     draw_text(screen, "Rain Chance", fonts["tiny"], TEXT_DIM, x, y + 4)
 
     hourly = (state.weather or {}).get("hourly", {})
@@ -1960,14 +1830,14 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
 
     for pct in (0, 25, 50, 75, 100):
         gy = _py(pct)
-        pygame.draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
+        _Draw.line(screen, BG, (chart_x, gy), (chart_x + chart_w, gy), 1)
 
     slot_w = chart_w / max(1, n)
     bar_w = max(8, min(18, int(slot_w * 0.36)))
 
     for i in range(1, n):
         gx = chart_x + int(i * slot_w)
-        pygame.draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
+        _Draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
 
     nws_by_time = {t: p for t, p in zip(nws_times, nws_pops)}
     for i, pct in enumerate(s_pops):
@@ -1975,8 +1845,8 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         om_py = _py(pct)
         om_h = max(1, chart_y + chart_h - om_py)
         om_x = cx - bar_w - 2
-        pygame.draw.rect(screen, (56, 102, 160), (om_x, om_py, bar_w, om_h), border_radius=3)
-        pygame.draw.rect(screen, ACCENT, (om_x, om_py, bar_w, om_h), 1, border_radius=3)
+        _Draw.rect(screen, (56, 102, 160), (om_x, om_py, bar_w, om_h), border_radius=3)
+        _Draw.rect(screen, ACCENT, (om_x, om_py, bar_w, om_h), 1, border_radius=3)
         om_lbl_y = max(chart_y + 10, om_py - 2)
 
         if s_times[i] in nws_by_time:
@@ -1984,8 +1854,8 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
             nws_py = _py(n_pct)
             nws_h = max(1, chart_y + chart_h - nws_py)
             nws_x = cx + 2
-            pygame.draw.rect(screen, (128, 102, 34), (nws_x, nws_py, bar_w, nws_h), border_radius=3)
-            pygame.draw.rect(screen, GOLD, (nws_x, nws_py, bar_w, nws_h), 1, border_radius=3)
+            _Draw.rect(screen, (128, 102, 34), (nws_x, nws_py, bar_w, nws_h), border_radius=3)
+            _Draw.rect(screen, GOLD, (nws_x, nws_py, bar_w, nws_h), 1, border_radius=3)
             nws_lbl_y = max(chart_y + 10, nws_py - 2)
 
             if abs(om_lbl_y - nws_lbl_y) < 12:
@@ -2013,9 +1883,9 @@ def draw_hourly_precip_widget(screen, state, fonts, x, y, w=440, h=200):
         legend_x = x + 300
         legend_y = y + 20
         legend_gap = 24
-        pygame.draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
+        _Draw.line(screen, ACCENT, (legend_x, legend_y + 8), (legend_x + 18, legend_y + 8), 3)
         draw_text(screen, "Open-Meteo", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y, anchor="topleft")
-        pygame.draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
+        _Draw.line(screen, GOLD, (legend_x, legend_y + 8 + legend_gap), (legend_x + 18, legend_y + 8 + legend_gap), 3)
         draw_text(screen, "NWS", fonts["tiny"], TEXT_DIM, legend_x + 22, legend_y + legend_gap, anchor="topleft")
 
 
@@ -2038,7 +1908,7 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
 
     panel_y = y + TITLE_H
     panel_h = h - TITLE_H
-    pygame.draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
+    _Draw.rect(screen, PANEL, (x, panel_y, w, panel_h), border_radius=10)
 
     lvl_pts = state.potomac_level   # [(epoch, feet), ...]
 
@@ -2068,7 +1938,7 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
         ).timestamp()
         if t_min <= midnight_ep <= now_ep:
             gx = _cx(midnight_ep)
-            pygame.draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
+            _Draw.line(screen, BG, (gx, chart_y), (gx, chart_y + chart_h), 1)
             day_lbl = (_date.today() + _td(days=d_off)).strftime("%a")
             draw_text(screen, day_lbl, fonts["tiny"], TEXT_DIM,
                       gx + 3, chart_y + chart_h + 2, anchor="midtop")
@@ -2097,18 +1967,18 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
             ticks.append(rv)
 
     # Spine
-    pygame.draw.line(screen, TEMP_NEUTRAL, (chart_x, chart_y), (chart_x, chart_y + chart_h), 1)
+    _Draw.line(screen, TEMP_NEUTRAL, (chart_x, chart_y), (chart_x, chart_y + chart_h), 1)
     for tv in ticks:
         ty = _ly(tv)
-        pygame.draw.line(screen, BG, (chart_x, ty), (chart_x + chart_w, ty), 1)
-        pygame.draw.line(screen, TEMP_NEUTRAL, (chart_x - 3, ty), (chart_x, ty), 1)  # tick mark
+        _Draw.line(screen, BG, (chart_x, ty), (chart_x + chart_w, ty), 1)
+        _Draw.line(screen, TEMP_NEUTRAL, (chart_x - 3, ty), (chart_x, ty), 1)  # tick mark
         draw_text(screen, f"{tv:.1f}", fonts["tiny"], TEMP_NEUTRAL,
                   chart_x - 6, ty, anchor="midright")
 
     # ── Gage height line ──────────────────────────────────────────────────────
     pts = [(_cx(ep), _ly(v)) for ep, v in vis_lv]
     if len(pts) >= 2:
-        pygame.draw.lines(screen, TEMP_NEUTRAL, False, pts, 2)
+        _Draw.lines(screen, TEMP_NEUTRAL, False, pts, 2)
 
     # Current value — top-right
     cur_lvl = lvl_pts[-1][1]
@@ -2137,7 +2007,7 @@ def draw_screen(screen, state, fonts, tick):
         runtime_error_source = state.runtime_error_source
         runtime_error_message = state.runtime_error_message
         now_local = datetime.now().astimezone()
-        draw_text(screen, datetime.now().strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, 60, 100)
+        draw_text(screen, now_local.strftime("%I:%M %p"), fonts["medium"], TEXT_DIM, W - 40, 40, anchor="topright")
         draw_text(screen, LOCATION_NAME, fonts["large"], TEXT_BRIGHT, 60, 40)
         date_display = f"{now_local:%A, %B} {now_local.day}, {now_local:%Y}"
         tz_abbrev = now_local.tzname() or "UNKNOWN"
@@ -2159,36 +2029,37 @@ def draw_screen(screen, state, fonts, tick):
         if has_current:
             temp_str = f"{round(cur['temperature_2m'])}°"
             temp_surf = fonts["huge"].render(temp_str, True, TEXT_BRIGHT)
-            screen.blit(temp_surf, (60, 140))
+            screen.blit(temp_surf, (60, 100))
             icon_x = 60 + temp_surf.get_width() + 18 + 65
-            draw_weather_icon(screen, cur["weather_code"], icon_x, 195, 130, GOLD)
+            draw_weather_icon(screen, cur["weather_code"], icon_x, 155, 130, GOLD)
         else:
             bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
             if bootstrap_loading:
-                draw_text(screen, "Loading forecast...", fonts["small"], GOLD, 60, 172)
-                draw_text(screen, "Waiting for first weather update", fonts["tiny"], TEXT_DIM, 60, 210)
+                draw_text(screen, "Loading forecast...", fonts["small"], GOLD, 60, 132)
+                draw_text(screen, "Waiting for first weather update", fonts["tiny"], TEXT_DIM, 60, 170)
             else:
-                draw_text(screen, "Forecast unavailable", fonts["small"], GOLD, 60, 172)
-                draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 210)
+                draw_text(screen, "Forecast unavailable", fonts["small"], GOLD, 60, 132)
+                draw_text(screen, "Weather API offline", fonts["tiny"], TEXT_DIM, 60, 170)
 
 
-        # Map box centered between left widget column and right 7-day panel.
-        left_col_right = 520
-        right_panel_left = W - 430
+        # Keep the map centered on the screen, independent of the side panels.
         mw, mh = 820, 720
-        mx = left_col_right + (right_panel_left - left_col_right - mw) // 2
+        mx = (W - mw) // 2
         my = 160
         draw_map(screen, state, fonts, mx, my, mw, mh)
 
         # Wind widget — center from the actual rendered 768px map surface.
         map_draw_x = mx + (mw - 768) // 2
         map_center_x = map_draw_x + 768 // 2
-        draw_wind_widget(screen, state, fonts, map_center_x - 10, my + mh + 6)
+        if isinstance(screen, _RenderSurface):
+            map_left = screen.point((map_draw_x, 0))[0]
+            map_center_x = (map_left + round(768 * screen.scale) // 2) / screen.scale
+        draw_wind_widget(screen, state, fonts, map_center_x, my + mh + 6)
 
         # 7-Day Forecast
         for i in range(7):
             ry = 140 + (i * 120)
-            pygame.draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
+            _Draw.rect(screen, PANEL, (W-430, ry, 390, 110), border_radius=15)
             if has_daily:
                 dt = datetime.strptime(daily["time"][i], "%Y-%m-%d")
                 code = daily["weather_code"][i]
@@ -2227,10 +2098,6 @@ def draw_screen(screen, state, fonts, tick):
                 draw_hourly_precip_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
             elif _wkey == "POTOMAC":
                 draw_potomac_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
-            elif _wkey == "NFLSTATS":
-                draw_nflstats_widget(screen, state, fonts, _COL_WIDGET_X, _wy, w=_COL_W, h=_wh)
-            elif _wkey == "RAM_PRICE":
-                draw_ram_widget(screen, state, fonts, _COL_X, _wy)
 
         show_banner = True
         if runtime_error_source == "WEATHER" and (not weather_loaded_once) and (time.time() - started_at < 90):
@@ -2261,22 +2128,63 @@ def draw_screen(screen, state, fonts, tick):
             state.motd_last_cycle = now
 
 
+def _display_surface(display):
+    """Use a native-resolution viewport with the existing layout coordinates."""
+    width, height = display.get_size()
+    if width * SCREEN_H <= height * SCREEN_W:
+        size = (width, max(1, width * SCREEN_H // SCREEN_W))
+    else:
+        size = (max(1, height * SCREEN_W // SCREEN_H), height)
+    viewport = pygame.Rect((0, 0), size)
+    viewport.center = display.get_rect().center
+    display.fill(BG)
+    return _RenderSurface(display.subsurface(viewport), (SCREEN_W, SCREEN_H))
+
+
+def _fullscreen_size():
+    """Use Retina pixels instead of desktop points on macOS."""
+    if sys.platform != "darwin" or pygame.display.get_driver() != "cocoa":
+        return (0, 0)
+
+    import ctypes
+
+    core = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+    core.CGMainDisplayID.argtypes = []
+    core.CGMainDisplayID.restype = ctypes.c_uint32
+    core.CGDisplayCopyDisplayMode.argtypes = [ctypes.c_uint32]
+    core.CGDisplayCopyDisplayMode.restype = ctypes.c_void_p
+    core.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+    core.CGDisplayModeRelease.restype = None
+    for name in ("CGDisplayModeGetPixelWidth", "CGDisplayModeGetPixelHeight"):
+        function = getattr(core, name)
+        function.argtypes = [ctypes.c_void_p]
+        function.restype = ctypes.c_size_t
+    mode = core.CGDisplayCopyDisplayMode(core.CGMainDisplayID())
+    if not mode:
+        return (0, 0)
+    try:
+        return (core.CGDisplayModeGetPixelWidth(mode), core.CGDisplayModeGetPixelHeight(mode))
+    finally:
+        core.CGDisplayModeRelease(mode)
+
+
 def main():
     if sys.platform == "win32":
         os.environ.setdefault("SDL_WINDOWS_DPI_AWARENESS", "permonitorv2")
     pygame.init()
-    screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+    display = pygame.display.set_mode(_fullscreen_size(), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
+    screen = _display_surface(display)
     pygame.mouse.set_visible(False)
 
     asset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
     regular_font_path = os.path.join(asset_dir, "LiberationSans-Regular.ttf")
     bold_font_path = os.path.join(asset_dir, "LiberationSans-Bold.ttf")
     fonts = {
-        "huge":   pygame.font.Font(bold_font_path, 160),
-        "large":  pygame.font.Font(bold_font_path, 65),
-        "medium": pygame.font.Font(regular_font_path, 40),
-        "small":  pygame.font.Font(regular_font_path, 30),
-        "tiny":   pygame.font.Font(regular_font_path, 20),
+        "huge":   _RenderFont(bold_font_path, 160, screen.scale),
+        "large":  _RenderFont(bold_font_path, 65, screen.scale),
+        "medium": _RenderFont(regular_font_path, 40, screen.scale),
+        "small":  _RenderFont(regular_font_path, 30, screen.scale),
+        "tiny":   _RenderFont(regular_font_path, 20, screen.scale),
     }
 
     state = AppState()
@@ -2301,14 +2209,11 @@ def main():
     _spawn("QUOTES", state.update_quotes)
     state.last_weather_upd = time.time()
     state.last_map_upd = time.time()
-    state.last_ram_upd = time.time()
 
     _spawn_delayed(5, "MAP", state.update_map)
-    if FEATURES["RAM_PRICE"]: _spawn_delayed(8, "RAM", state.update_ram)
     if FEATURES["OSV_TIDES"] or FEATURES["COORDINATE_TIDES"]: _spawn_delayed(3, "TIDES", state.update_tides)
     if FEATURES["OSV_COUNT"]: _spawn_delayed(6, "OSV", state.update_osv)
     if FEATURES["POTOMAC"]:   _spawn_delayed(7, "POTOMAC", state.update_potomac)
-    if FEATURES["NFLSTATS"] and NFL_API_KEY: _spawn_delayed(9, "NFL", state.update_nflstats)
 
     clock, tick = pygame.time.Clock(), 0
     while True:
@@ -2329,9 +2234,6 @@ def main():
         if now - state.last_map_upd > 60 and not state._map_running:
             state.last_map_upd = now
             _spawn("MAP", state.update_map)
-        if now - state.last_ram_upd > 60 and not state._ram_running and FEATURES["RAM_PRICE"]:
-            state.last_ram_upd = now
-            _spawn("RAM", state.update_ram)
         if now - state.last_tide_upd > 300 and not state._tide_running and (FEATURES["OSV_TIDES"] or FEATURES["COORDINATE_TIDES"]):
             state.last_tide_upd = now
             _spawn("TIDES", state.update_tides)
@@ -2341,9 +2243,6 @@ def main():
         if now - state.last_potomac_upd > 300 and not state._potomac_running and FEATURES["POTOMAC"]:
             state.last_potomac_upd = now
             _spawn("POTOMAC", state.update_potomac)
-        if now - state.last_nfl_upd > 300 and not state._nfl_running and FEATURES["NFLSTATS"] and NFL_API_KEY:
-            state.last_nfl_upd = now
-            _spawn("NFL", state.update_nflstats)
 
         draw_screen(screen, state, fonts, tick)
         pygame.display.flip()

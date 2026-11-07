@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -eu
+
+export XDG_CURRENT_DESKTOP=LXDE
+xset s off
+xset s noblank
+xset -dpms
+openbox --config-file /usr/local/share/weather-station/openbox.xml &
+lxpolkit &
+pcmanfm --desktop --profile weather-station &
+DESKTOP_PID=$!
+/usr/local/bin/weather-station-launch &
+wait "$DESKTOP_PID"

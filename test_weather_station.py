@@ -1,5 +1,9 @@
 import json
+import math
+import os
+import runpy
 import unittest
+from configparser import ConfigParser
 from unittest.mock import MagicMock, patch
 
 
@@ -18,6 +22,314 @@ with (
     import weather_station as ws
 
 
+class DeploymentSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.config = ConfigParser()
+        _read_test_config(self.config, None)
+        self.config.read_dict({
+            "GENERAL": {"DEPLOYMENT_ID": "test-station", "SELF_UPDATE_INTERVAL_S": "21600"},
+            "FEATURES": {"HOURLY_FORECAST": "false", "POTOMAC": "true"},
+        })
+
+    def apply_remote(self, data):
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = data
+        with patch.object(ws.urllib.request, "urlopen", return_value=response) as fetch:
+            merged = ws._apply_deployment_settings(self.config)
+        fetch.assert_called_once_with(
+            "https://raw.githubusercontent.com/moormanm/weather-station/main/"
+            "deployments/test-station.ini",
+            timeout=5,
+        )
+        return merged
+
+    def test_partial_overrides_keep_local_values_and_deployment_id(self):
+        merged = self.apply_remote(
+            b"[LOCATION]\nNAME=Remote station\n"
+            b"[FEATURES]\nHOURLY_FORECAST=true\n"
+            b"[GENERAL]\nDEPLOYMENT_ID=other-station\nSELF_UPDATE_INTERVAL_S=3600\n"
+        )
+        self.assertEqual(merged.get("LOCATION", "NAME"), "Remote station")
+        self.assertEqual(merged.getfloat("LOCATION", "LATITUDE"), 39.46694)
+        self.assertTrue(merged.getboolean("FEATURES", "HOURLY_FORECAST"))
+        self.assertTrue(merged.getboolean("FEATURES", "POTOMAC"))
+        self.assertEqual(merged.get("GENERAL", "DEPLOYMENT_ID"), "test-station")
+        self.assertEqual(merged.getint("GENERAL", "SELF_UPDATE_INTERVAL_S"), 3600)
+        self.assertEqual(self.config.get("LOCATION", "NAME"), "Frederick, MD")
+        self.assertFalse(self.config.getboolean("FEATURES", "HOURLY_FORECAST"))
+
+    def test_disabled_or_invalid_id_does_not_make_a_request(self):
+        for deployment_id in ("", "../other", "a/b", "a?b", "a" * 129):
+            with self.subTest(deployment_id=deployment_id):
+                self.config.set("GENERAL", "DEPLOYMENT_ID", deployment_id)
+                with patch.object(ws.urllib.request, "urlopen") as fetch:
+                    self.assertIs(ws._apply_deployment_settings(self.config), self.config)
+                fetch.assert_not_called()
+
+    def test_network_errors_use_local_settings(self):
+        for error in (
+            TimeoutError("Connection timed out"),
+            ws.urllib.error.URLError("Offline"),
+            ws.urllib.error.HTTPError("url", 404, "Not found", {}, None),
+        ):
+            if isinstance(error, ws.urllib.error.HTTPError):
+                self.addCleanup(error.close)
+            with self.subTest(error=error), patch.object(
+                ws.urllib.request, "urlopen", side_effect=error
+            ):
+                self.assertIs(ws._apply_deployment_settings(self.config), self.config)
+
+    def test_invalid_remote_settings_are_not_partially_applied(self):
+        for data in (
+            b"not an INI file",
+            b"\xff",
+            b"x" * 65537,
+            b"[LOCATION]\nNAME=Remote\nLATITUDE=nan\n",
+            b"[LOCATION]\nLONGITUDE=181\n",
+            b"[LOCATION]\nMAP_LAT=91\n",
+            b"[LOCATION]\nNAME=\n",
+            b"[FEATURES]\nSUNTIME=invalid\n",
+            b"[GENERAL]\nSELF_UPDATE_INTERVAL_S=0\n",
+        ):
+            with self.subTest(data=data[:80]):
+                self.assertIs(self.apply_remote(data), self.config)
+
+    def test_remote_settings_are_applied_before_app_constants(self):
+        def read_config(config, path):
+            config.read_dict(self.config)
+
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = (
+            b"[LOCATION]\nLATITUDE=40\nNAME=Remote station\n"
+            b"[FEATURES]\nHOURLY_FORECAST=true\n"
+        )
+        with (
+            patch("pathlib.Path.exists", return_value=True),
+            patch("configparser.ConfigParser.read", read_config),
+            patch("os.makedirs"),
+            patch("urllib.request.urlopen", return_value=response),
+        ):
+            app = runpy.run_path(ws.__file__)
+        self.assertEqual(app["LATITUDE"], 40)
+        self.assertEqual(app["LOCATION_NAME"], "Remote station")
+        self.assertTrue(app["FEATURES"]["HOURLY_FORECAST"])
+
+
+class DisplayScalingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        ws.pygame.font.init()
+        cls.font_path = os.path.join(os.path.dirname(ws.__file__), "assets", "LiberationSans-Regular.ttf")
+
+    def test_dashboard_fits_common_display_sizes_without_stretching(self):
+        cases = [
+            ((1280, 720), (0, 0, 1280, 720)),
+            ((1920, 1080), (0, 0, 1920, 1080)),
+            ((1512, 982), (0, 66, 1512, 850)),
+            ((3456, 2234), (0, 145, 3456, 1944)),
+            ((2560, 1440), (0, 0, 2560, 1440)),
+            ((3840, 2160), (0, 0, 3840, 2160)),
+            ((3440, 1440), (440, 0, 2560, 1440)),
+            ((1280, 1024), (0, 152, 1280, 720)),
+            ((1080, 1920), (0, 657, 1080, 607)),
+        ]
+        for size, bounds in cases:
+            with self.subTest(size=size):
+                display = ws.pygame.Surface(size)
+                display.fill(ws.RED)
+                screen = ws._display_surface(display)
+                screen.fill(ws.ACCENT)
+                ws._Draw.rect(screen, ws.GOLD, (960, 0, 960, 1080))
+                viewport = ws.pygame.Rect(bounds)
+                for point, color in (
+                    (viewport.topleft, ws.ACCENT),
+                    ((viewport.left, viewport.bottom - 1), ws.ACCENT),
+                    ((viewport.right - 1, viewport.bottom - 1), ws.GOLD),
+                ):
+                    self.assertEqual(display.get_at(point)[:3], color)
+                if viewport.left:
+                    self.assertEqual(display.get_at((viewport.left - 1, viewport.centery))[:3], ws.BG)
+                    self.assertEqual(display.get_at((viewport.right, viewport.centery))[:3], ws.BG)
+                if viewport.top:
+                    self.assertEqual(display.get_at((viewport.centerx, viewport.top - 1))[:3], ws.BG)
+                    self.assertEqual(display.get_at((viewport.centerx, viewport.bottom))[:3], ws.BG)
+
+    def test_full_hd_keeps_original_pixels_without_resampling(self):
+        display = ws.pygame.Surface((1920, 1080))
+        screen = ws._display_surface(display)
+        with patch.object(ws.pygame.transform, "smoothscale") as scale:
+            ws.draw_text(screen, "Forecast", ws._RenderFont(self.font_path, 30, 1), ws.GOLD, 123, 456)
+        scale.assert_not_called()
+
+    def test_text_is_rendered_at_native_size_without_bitmap_scaling(self):
+        for size in ((1280, 720), (2560, 1440), (3840, 2160)):
+            with self.subTest(size=size):
+                display = ws.pygame.Surface(size)
+                screen = ws._display_surface(display)
+                font = ws._RenderFont(self.font_path, 30, screen.scale)
+                expected = ws.pygame.font.Font(self.font_path, round(30 * screen.scale)).render(
+                    "Forecast 67°", True, ws.GOLD
+                )
+                with patch.object(ws.pygame.transform, "smoothscale") as scale:
+                    image = font.render("Forecast 67°", True, ws.GOLD)
+                    ws.draw_text(screen, "Forecast 67°", font, ws.GOLD, 60, 100)
+                scale.assert_not_called()
+                self.assertEqual(image.surface.get_size(), expected.get_size())
+                self.assertEqual(
+                    ws.pygame.image.tobytes(image.surface, "RGBA"),
+                    ws.pygame.image.tobytes(expected, "RGBA"),
+                )
+                reference = ws.pygame.Surface(size)
+                reference.fill(ws.BG)
+                reference.blit(expected, screen.point((60, 100)))
+                self.assertEqual(
+                    ws.pygame.image.tobytes(display, "RGB"),
+                    ws.pygame.image.tobytes(reference, "RGB"),
+                )
+
+    def test_chart_lines_use_native_coordinates_and_widths(self):
+        display = ws.pygame.Surface((3840, 2160))
+        screen = ws._display_surface(display)
+        reference = display.copy()
+        ws.pygame.draw.line(reference, ws.GOLD, (120, 200), (240, 400), 4)
+        ws.pygame.draw.circle(reference, ws.ACCENT, (600, 800), 10, 2)
+        with patch.object(ws.pygame.transform, "smoothscale") as scale:
+            ws._Draw.line(screen, ws.GOLD, (60, 100), (120, 200), 2)
+            ws._Draw.circle(screen, ws.ACCENT, (300, 400), 5, 1)
+        scale.assert_not_called()
+        self.assertEqual(
+            ws.pygame.image.tobytes(display, "RGB"),
+            ws.pygame.image.tobytes(reference, "RGB"),
+        )
+
+    def test_widget_surfaces_keep_native_text_and_transparency(self):
+        display = ws.pygame.Surface((2560, 1440))
+        screen = ws._display_surface(display)
+        child = screen.child((120, 100))
+        font = ws._RenderFont(self.font_path, 20, screen.scale)
+        with patch.object(ws.pygame.transform, "smoothscale") as scale:
+            ws.draw_text(child, "Wind", font, ws.GOLD, 10, 10)
+            screen.blit(child, (60, 100))
+        scale.assert_not_called()
+        self.assertEqual(child.surface.get_size(), (160, 133))
+        self.assertEqual(display.get_at(screen.point((60, 100)))[:3], ws.BG)
+
+    def test_map_and_wind_are_centered_on_macbook_and_hd_displays(self):
+        state = ws.AppState()
+        state.motd_last_cycle = ws.time.time()
+        for size in ((1512, 982), (1920, 1080), (2560, 1440), (3440, 1440)):
+            with self.subTest(size=size):
+                display = ws.pygame.Surface(size)
+                screen = ws._display_surface(display)
+                fonts = {
+                    key: ws._RenderFont(self.font_path, size, screen.scale)
+                    for key, size in (("huge", 160), ("large", 65), ("medium", 40), ("small", 30), ("tiny", 20))
+                }
+                with patch.object(ws, "draw_map") as draw_map, patch.object(ws, "draw_wind_widget") as wind:
+                    ws.draw_screen(screen, state, fonts, 0)
+                mx, _, mw, _ = draw_map.call_args.args[3:]
+                map_center = mx + mw / 2
+                self.assertEqual(map_center, 960)
+                self.assertEqual(wind.call_args.args[3], map_center)
+                viewport = screen.surface.get_abs_offset()
+                self.assertLessEqual(abs(viewport[0] + map_center * screen.scale - size[0] / 2), 1)
+
+    def test_map_marker_and_rounded_mask_use_native_positions(self):
+        state = ws.AppState()
+        state.map_tiles = {(x, y): b"tile" for x in (-1, 0, 1) for y in (-1, 0, 1)}
+        tile = ws.pygame.Surface((256, 256), ws.pygame.SRCALPHA)
+        tile.fill(ws.PANEL)
+        loaded = MagicMock()
+        loaded.convert_alpha.return_value = tile
+        for size in ((1512, 982), (1920, 1080), (3456, 2234)):
+            with self.subTest(size=size):
+                display = ws.pygame.Surface(size)
+                screen = ws._display_surface(display)
+                fonts = {"tiny": ws._RenderFont(self.font_path, 20, screen.scale)}
+                with (
+                    patch.object(ws.pygame.image, "load", return_value=loaded),
+                    patch.object(ws, "MAP_LAT", ws.LATITUDE),
+                    patch.object(ws, "MAP_LONG", ws.LONGITUDE),
+                ):
+                    ws.draw_map(screen, state, fonts, 550, 160, 820, 720)
+                offset_x, offset_y = screen.surface.get_abs_offset()
+                for point, color in (((960, 520), ws.TEXT_BRIGHT), ((576, 136), ws.BG)):
+                    x, y = screen.point(point)
+                    self.assertEqual(display.get_at((x + offset_x, y + offset_y))[:3], color)
+                x, y = screen.point((600, 160))
+                for actual, expected in zip(display.get_at((x + offset_x, y + offset_y))[:3], ws.PANEL):
+                    self.assertLessEqual(abs(actual - expected), 3)
+
+    def test_map_coverage_and_compass_center_match_in_rendered_pixels(self):
+        n = 2 ** ws.MAP_ZOOM
+        tile = ws.pygame.Surface((256, 256), ws.pygame.SRCALPHA)
+        tile.fill(ws.PANEL)
+        loaded = MagicMock()
+        loaded.convert_alpha.return_value = tile
+        for fraction in (0.1, 0.9):
+            tile_x, tile_y = 40 + fraction, 50 + fraction
+            longitude = tile_x / n * 360 - 180
+            latitude = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * tile_y / n))))
+            state = ws.AppState()
+            metadata = json.dumps({"host": "https://radar.test", "radar": {"past": [{"path": "/frame"}]}}).encode()
+            with (
+                patch.object(ws, "MAP_LAT", latitude),
+                patch.object(ws, "MAP_LONG", longitude),
+                patch.object(ws.os.path, "exists", return_value=False),
+                patch.object(ws, "safe_fetch", side_effect=lambda url, **kwargs: metadata if url.endswith("weather-maps.json") else b"\x89PNGtile"),
+            ):
+                state._do_update_map()
+                self.assertEqual(len(state.map_tiles), 16)
+                self.assertEqual(set(state.map_tiles), set(state.map_label_tiles))
+                self.assertEqual(set(state.map_tiles), set(state.radar_tiles))
+                state.map_label_tiles = {}
+                state.radar_tiles = {}
+                state.weather = {"current": {"temperature_2m": 67, "weather_code": 0, "wind_speed_10m": 18, "wind_direction_10m": 225}}
+                state.motd_last_cycle = ws.time.time()
+                for size in ((1512, 982), (1728, 1117), (1920, 1080), (3456, 2234)):
+                    with self.subTest(fraction=fraction, size=size):
+                        display = ws.pygame.Surface(size)
+                        screen = ws._display_surface(display)
+                        fonts = {
+                            key: ws._RenderFont(self.font_path, font_size, screen.scale)
+                            for key, font_size in (("huge", 160), ("large", 65), ("medium", 40), ("small", 30), ("tiny", 20))
+                        }
+                        with patch.object(ws.pygame.image, "load", return_value=loaded):
+                            ws.draw_screen(screen, state, fonts, 0)
+                        pixels = screen.surface
+                        map_y = screen.point((0, 300))[1]
+                        map_edges = [x for x in range(round(550 * screen.scale), round(1400 * screen.scale)) if pixels.get_at((x, map_y))[:3] != ws.BG]
+                        compass_y = screen.point((0, 886))[1]
+                        compass_edges = [x for x in range(round(550 * screen.scale), round(1400 * screen.scale)) if pixels.get_at((x, compass_y))[:3] == ws.TEXT_DIM]
+                        expected_width = round(768 * screen.scale)
+                        self.assertLessEqual(abs(map_edges[-1] - map_edges[0] + 1 - expected_width), 1)
+                        self.assertLessEqual(abs(sum((map_edges[0], map_edges[-1])) / 2 - sum((compass_edges[0], compass_edges[-1])) / 2), 0.5)
+
+    def test_mac_fullscreen_uses_retina_pixels_and_releases_display_mode(self):
+        core = MagicMock()
+        core.CGDisplayCopyDisplayMode.return_value = 123
+        core.CGDisplayModeGetPixelWidth.return_value = 3456
+        core.CGDisplayModeGetPixelHeight.return_value = 2234
+        with (
+            patch.object(ws.sys, "platform", "darwin"),
+            patch.object(ws.pygame.display, "get_driver", return_value="cocoa"),
+            patch("ctypes.CDLL", return_value=core),
+        ):
+            self.assertEqual(ws._fullscreen_size(), (3456, 2234))
+        core.CGDisplayModeRelease.assert_called_once_with(123)
+
+    def test_non_mac_displays_keep_sdl_resolution_detection(self):
+        for platform, driver in (("linux", "x11"), ("win32", "windows"), ("darwin", "dummy")):
+            with (
+                self.subTest(platform=platform, driver=driver),
+                patch.object(ws.sys, "platform", platform),
+                patch.object(ws.pygame.display, "get_driver", return_value=driver),
+                patch("ctypes.CDLL") as load,
+            ):
+                self.assertEqual(ws._fullscreen_size(), (0, 0))
+                load.assert_not_called()
+
+
 class CurrentTemperatureTests(unittest.TestCase):
     def test_display_uses_open_meteo_temperature(self):
         class StopDrawing(Exception):
@@ -30,13 +342,38 @@ class CurrentTemperatureTests(unittest.TestCase):
         screen.get_size.return_value = (1920, 1080)
         fonts = {key: MagicMock() for key in ("medium", "large", "small", "huge")}
         with (
-            patch.object(ws, "draw_text"),
-            patch.object(ws, "draw_weather_icon"),
+            patch.object(ws, "draw_text") as text,
+            patch.object(ws, "draw_weather_icon") as icon,
             patch.object(ws, "draw_map", side_effect=StopDrawing),
             self.assertRaises(StopDrawing),
         ):
             ws.draw_screen(screen, state, fonts, 0)
         self.assertEqual(fonts["huge"].render.call_args.args[0], "67°")
+        screen.blit.assert_called_once_with(fonts["huge"].render.return_value, (60, 100))
+        clock = text.call_args_list[0]
+        self.assertEqual(clock.args[4:], (1880, 40))
+        self.assertEqual(clock.kwargs, {"anchor": "topright"})
+        self.assertEqual(icon.call_args.args[3], 155)
+
+    def test_left_widgets_use_the_space_below_the_raised_temperature(self):
+        state = ws.AppState()
+        state.motd_last_cycle = ws.time.time()
+        screen = MagicMock()
+        screen.get_size.return_value = (1920, 1080)
+        fonts = {key: MagicMock() for key in ("medium", "large", "small", "huge", "tiny")}
+        fonts["small"].render.return_value.get_width.return_value = 100
+        with (
+            patch.dict(ws.FEATURES, {key: key in ("SUNTIME", "HOURLY_FORECAST") for key in ws.FEATURES}),
+            patch.object(ws, "draw_text"),
+            patch.object(ws, "draw_map"),
+            patch.object(ws, "draw_wind_widget"),
+            patch.object(ws._Draw, "rect"),
+            patch.object(ws, "draw_suntime") as suntime,
+            patch.object(ws, "draw_hourly_widget") as hourly,
+        ):
+            ws.draw_screen(screen, state, fonts, 0)
+        self.assertEqual(suntime.call_args.args[4], 310)
+        self.assertEqual(hourly.call_args.args[4], 402)
 
     def test_update_keeps_nws_highs_and_lows(self):
         state = ws.AppState()
@@ -50,6 +387,30 @@ class CurrentTemperatureTests(unittest.TestCase):
             state._do_update_weather()
         self.assertEqual(state.nws_hilo, hilo)
         self.assertEqual(state.weather["current"]["temperature_2m"], 67)
+
+
+class RemovedFeatureTests(unittest.TestCase):
+    def test_old_settings_do_not_change_the_remaining_widgets(self):
+        def read_legacy_config(config, path):
+            _read_test_config(config, path)
+            config.read_dict({
+                "FEATURES": {"RAM_PRICE": "unused", "NFLSTATS": "unused"},
+                "NFLSTATS": {"API-KEY": "unused-key"},
+            })
+
+        with (
+            patch("pathlib.Path.exists", return_value=True),
+            patch("configparser.ConfigParser.read", read_legacy_config),
+            patch("os.makedirs"),
+        ):
+            legacy = runpy.run_path(ws.__file__)
+        self.assertEqual(legacy["_left_column_layout"](), ws._left_column_layout())
+
+    def test_removed_widgets_do_not_reserve_column_space(self):
+        features = {key: False for key in ws.FEATURES}
+        features.update({"RAM_PRICE": True, "NFLSTATS": True})
+        with patch.dict(ws.FEATURES, features, clear=True):
+            self.assertEqual(ws._left_column_layout(), [])
 
 
 class CoordinateTideTests(unittest.TestCase):

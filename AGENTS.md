@@ -11,6 +11,13 @@ cp ws-settings.ini.example ~/ws-settings.ini
 
 `~/ws-settings.ini` is read at **module import time**, before `main()`. The app crashes immediately if the file is absent. It lives in `$HOME`, not the project directory.
 
+Set `[GENERAL] DEPLOYMENT_ID` to load `deployments/<DEPLOYMENT_ID>.ini` from
+`moormanm/weather-station` on `main` at startup. Remote values override matching
+local values in memory. The local file and deployment ID do not change.
+Missing, invalid, or unavailable remote files leave local settings in use.
+The request has a 5-second socket timeout. Keep valid local settings for offline use.
+Deployment files are public. Do not put passwords or secrets in them.
+
 ## Developer commands
 
 ```bash
@@ -36,11 +43,11 @@ black weather_station.py
 
 ## Left-column layout engine
 
-The left column (x=60–520, y=350–1000) is managed by `_left_column_layout()`. Do **not** hardcode y-coordinates for left-column widgets.
+The left column (x=60–520, y=310–1000) is managed by `_left_column_layout()`. Do **not** hardcode y-coordinates for left-column widgets.
 
 - `_COL_CATALOG` (module level, ~line 1398) defines widget order, minimum heights, and which widgets are "growable" (charts). Edit this list to reorder or add widgets.
 - Growable widgets (`OSV_TIDES`, `HOURLY_FORECAST`, `HOURLY_PRECIP`, `POTOMAC`) expand equally to fill available space, capped at `_COL_MAX_H = 400 px`.
-- Fixed widgets (`SUNTIME`, `OSV_COUNT`, `NFLSTATS`, `RAM_PRICE`) keep their catalog `min_h`.
+- Fixed widgets (`SUNTIME`, `OSV_COUNT`) keep their catalog `min_h`.
 - The loop in `draw_screen()` dispatches to each draw function with the computed `(y, h)`.
 
 ## Features / widgets
@@ -50,12 +57,10 @@ Some features are off by default. Enable in `~/ws-settings.ini` under `[FEATURES
 - `OSV_COUNT`
 - `OSV_TIDES`
 - `COORDINATE_TIDES` (nearest NOAA tide prediction station to `LATITUDE`/`LONGITUDE`; takes priority over `OSV_TIDES`, with one chart)
-- `RAM_PRICE`
 - `HOURLY_FORECAST`
 - `HOURLY_PRECIP` (if omitted, it falls back to the `HOURLY_FORECAST` value)
 - `SUNTIME`
 - `POTOMAC`
-- `NFLSTATS` (also requires `[NFLSTATS] API-KEY`)
 
 
 ## Location behavior and hardcoded constants
@@ -71,7 +76,7 @@ There are **no** hardcoded `NWS_FORECAST_URL` or `NWS_STATIONS_URL` constants an
 Still hardcoded in `weather_station.py` (not in settings):
 
 ```python
-SCREEN_W, SCREEN_H = 1920, 1080
+SCREEN_W, SCREEN_H = 1920, 1080  # Logical layout size.
 MAP_ZOOM = 7
 OSV_TIDES NOAA tide station = 8570283 (COORDINATE_TIDES selects the nearest prediction station)
 font = "dejavusans"
@@ -79,7 +84,21 @@ font = "dejavusans"
 
 Note: timezone is also resolved dynamically from NWS `/points` (`properties.timeZone`), not hardcoded.
 
+The app uses the current desktop resolution in fullscreen mode. `_RenderSurface`, `_RenderFont`, and `_Draw` use logical layout coordinates to draw text and shapes at native resolution. Do not scale the completed frame. Use `_Draw` for widget shapes and `_render_child()` for widget surfaces. Map tile images still use smooth scaling. Other aspect ratios have centered margins.
+
+On macOS, `_fullscreen_size()` reads the current display mode through CoreGraphics to get Retina pixel dimensions instead of logical desktop dimensions. Other systems use SDL desktop detection.
+
 ## Production (Raspberry Pi) — do not change carelessly
+
+- `./build-image-simpler.sh` customizes a cached official 64-bit Lite image in
+  Docker. It adds the small X11 desktop, app, and settings without rebuilding
+  the OS. It checks the base-image checksum, caches Debian packages, and saves
+  an uncompressed `.img` for Raspberry Pi Imager. The account is `pi/pi`,
+  Wi-Fi country is US, and SSH is disabled.
+- `./build-image.sh` uses pi-gen and Docker to create a 64-bit image for
+  Raspberry Pi Imager. It includes the app, settings, and maintenance desktop.
+  The account is `pi/pi`, Wi-Fi country is US, and SSH is disabled.
+  The build skips package-history downloads and uses fast XZ compression.
 
 - `launch.sh` runs `git pull origin main` on every launch — **any push to `main` is auto-deployed at next RPi start**.
 - Production uses `/usr/bin/python3` (system Python), not the venv.
@@ -89,4 +108,3 @@ Note: timezone is also resolved dynamically from NWS `/points` (`properties.time
 
 - The root directory is also a venv (`bin/`, `include/`, `lib/`, `pyvenv.cfg` at root are venv artefacts, gitignored). `.venv/` is the cleaner copy — use that for development.
 - `.idea/` PyCharm config is **committed** (not gitignored). Black is configured there as the IDE formatter but is not in the venv.
-- RAM price history persists in `~/.cache/weather_station_tiles/ram_price_history.json`.

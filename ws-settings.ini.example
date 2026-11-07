@@ -23,7 +23,6 @@
 
 
 [FEATURES]
-RAM_PRICE=false
 OSV_COUNT=false
 OSV_TIDES=false
 # Use the nearest NOAA tide prediction station. Takes priority over OSV_TIDES.
@@ -34,8 +33,8 @@ SUNTIME=false
 POTOMAC=false
 
 [GENERAL]
+# Optional: load deployments/<DEPLOYMENT_ID>.ini from GitHub at startup.
+# Remote values override local values. Keep a valid local location for offline use.
+DEPLOYMENT_ID=
 # Self update check interval (in seconds). Default: 6 hours.
 SELF_UPDATE_INTERVAL_S=21600
-
-[NFLSTATS]
-API-KEY=

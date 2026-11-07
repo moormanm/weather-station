@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -eu
+
+cd "$HOME/weather-station"
+# Start the included version. The app checks for updates after startup.
+while true; do
+    if /usr/bin/python3 -u weather_station.py >> "$HOME/weather_station.log" 2>&1; then
+        exit 0
+    fi
+    sleep 5
+done

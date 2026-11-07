@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <radialGradient id="background">
+      <stop stop-color="#142d43"/>
+      <stop offset="0.55" stop-color="#0e1b2c"/>
+      <stop offset="1" stop-color="#0a0e1a"/>
+    </radialGradient>
+    <radialGradient id="halo">
+      <stop stop-color="#40c4ff" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#40c4ff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sun" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop stop-color="#fff3ba"/>
+      <stop offset="0.5" stop-color="#ffc850"/>
+      <stop offset="1" stop-color="#ff8c42"/>
+    </linearGradient>
+    <linearGradient id="cloud" x1="0%" y1="0%" x2="80%" y2="100%">
+      <stop stop-color="#e0f8ff"/>
+      <stop offset="0.45" stop-color="#73dcff"/>
+      <stop offset="1" stop-color="#258bbb"/>
+    </linearGradient>
+    <linearGradient id="orbit" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop stop-color="#40c4ff" stop-opacity="0"/>
+      <stop offset="0.55" stop-color="#40c4ff" stop-opacity="0.2"/>
+      <stop offset="1" stop-color="#b6efff" stop-opacity="0.8"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#background)"/>
+  <circle cx="960" cy="540" r="400" fill="url(#halo)"/>
+  <g fill="none" stroke="#7edaff">
+    <circle cx="960" cy="540" r="216" opacity="0.08"/>
+    <circle cx="960" cy="540" r="246" opacity="0.05"/>
+    <path d="M960 314v16m0 420v16M734 540h16m420 0h16" opacity="0.25"/>
+  </g>
+  <ellipse cx="960" cy="553" rx="262" ry="116" transform="rotate(-28 960 553)"
+    fill="none" stroke="url(#orbit)" stroke-width="2"/>
+  <g stroke="#ffc850" stroke-width="4" stroke-linecap="round" opacity="0.65">
+    <path d="M1020 358v-16m69 45 12-12m17 81h17m-190-69-12-12"/>
+  </g>
+  <circle cx="1020" cy="456" r="78" fill="url(#sun)"/>
+  <circle cx="1020" cy="456" r="88" fill="none" stroke="#ffc850" opacity="0.12"/>
+  <path d="M851 639a60 60 0 0 1-5-120 77 77 0 0 1 144-39 58 58 0 0 1 93 47h2a56 56 0 0 1 0 112Z"
+    fill="#030b16" opacity="0.3"/>
+  <path d="M851 621a60 60 0 0 1-5-120 77 77 0 0 1 144-39 58 58 0 0 1 93 47h2a56 56 0 0 1 0 112Z"
+    fill="url(#cloud)" stroke="#d3f5ff" stroke-opacity="0.4" stroke-width="2"/>
+  <path d="M851 607h234" fill="none" stroke="#d3f5ff" stroke-opacity="0.2"
+    stroke-width="2" stroke-linecap="round"/>
+  <g fill="#7edaff">
+    <circle cx="1191" cy="474" r="4"/>
+    <circle cx="747" cy="635" r="2" opacity="0.5"/>
+  </g>
+</svg>

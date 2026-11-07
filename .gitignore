@@ -21,3 +21,6 @@ pyvenv.cfg
 .idea/
 *.swp
 *.swo
+
+# Image build files contain passwords and settings.
+.image-build/
