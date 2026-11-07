@@ -3,6 +3,12 @@
   <focus>
     <focusNew>yes</focusNew>
   </focus>
+  <applications>
+    <application name="weather-station-first-boot">
+      <fullscreen>yes</fullscreen>
+      <focus>yes</focus>
+    </application>
+  </applications>
   <keyboard>
     <keybind key="A-F4">
       <action name="Close"/>

@@ -363,21 +363,37 @@ class ImageLocationConfigTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.kwargs["timeout"], 10)
         self.assertEqual(results, [("4600 SILVER HILL RD, WASHINGTON, DC, 20233", 38.846, -76.927)])
 
-    def test_lookup_requires_consent_and_match_confirmation(self):
-        answers = ["a", "n", "a", "y", "address", "1", "n", "m", "39.5", "-77.4"]
+    def test_lookup_confirmation_can_be_rejected(self):
+        answers = ["address", "1", self.location.SetupCancelled(), "", "39.5", "-77.4"]
         with (
-            patch("builtins.input", side_effect=answers),
+            patch.object(self.location, "dialog", side_effect=answers),
             patch.object(self.location, "lookup_address", return_value=[("Matched", 38.8, -76.9)]) as lookup,
         ):
             result = self.location.choose_location()
         lookup.assert_called_once_with("address")
         self.assertEqual(result, ("39.5", "-77.4"))
 
+    def test_address_prompt_explains_where_the_address_is_sent(self):
+        with (
+            patch.object(self.location, "dialog", side_effect=["", "39", "-77"]) as dialog,
+            patch.object(self.location, "lookup_address") as lookup,
+        ):
+            self.assertEqual(self.location.choose_location(), ("39", "-77"))
+        prompt = dialog.call_args_list[0].args[1]
+        self.assertIn("U.S. Census Bureau", prompt)
+        lookup.assert_not_called()
+
+    def test_dialog_can_be_cancelled(self):
+        result = subprocess.CompletedProcess(["whiptail"], 1, stderr="")
+        with patch.object(self.location.subprocess, "run", return_value=result):
+            with self.assertRaises(self.location.SetupCancelled):
+                self.location.dialog("--inputbox", "Address", "10", "74")
+
     def test_lookup_failure_and_no_match_allow_manual_entry(self):
         for outcome in (OSError("Offline"), []):
             with (
                 self.subTest(outcome=outcome),
-                patch("builtins.input", side_effect=["a", "y", "address", "m", "39", "-77"]),
+                patch.object(self.location, "dialog", side_effect=["address", "", "", "39", "-77"]),
                 patch.object(self.location, "lookup_address", side_effect=outcome if isinstance(outcome, Exception) else None,
                              return_value=outcome if isinstance(outcome, list) else None),
             ):
@@ -390,7 +406,7 @@ class ImageLocationConfigTests(unittest.TestCase):
             settings.write_text((root / "ws-settings.ini.example").read_text())
             with (
                 patch.object(sys, "argv", ["configure-location.py", "--interactive", str(settings)]),
-                patch("builtins.input", side_effect=["Station", "a", "y", "address", "2", "y"]),
+                patch.object(self.location, "dialog", side_effect=["Station", "address", "2", ""]),
                 patch.object(self.location, "lookup_address", return_value=[
                     ("First", 1, 2), ("Second", 38.846, -76.927)
                 ]),
@@ -451,6 +467,43 @@ class ImageLocationConfigTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(settings.read_text(), original)
 
+    def test_setup_forms_save_features_general_and_map_settings(self):
+        root = pathlib.Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            settings.write_text(
+                "[LOCATION]\nNAME=Old\nLATITUDE=39\nLONGITUDE=-77\nMAP_LAT=40\n"
+                "[FEATURES]\nSUNTIME=false\n[GENERAL]\nDEPLOYMENT_ID=old\n"
+                "SELF_UPDATE_INTERVAL_S=21600\n[OTHER]\nVALUE=keep\n"
+            )
+            answers = [self.location.SetupCancelled(), "SUNTIME\nALT_PREDICTIONS", "site-1", "3600", "", "-76"]
+            with patch.object(self.location, "dialog", side_effect=answers):
+                self.location.interactive_setup(str(settings))
+            config = ConfigParser()
+            config.read(settings)
+            self.assertEqual(config.get("LOCATION", "NAME"), "Old")
+            self.assertFalse(config.has_option("LOCATION", "MAP_LAT"))
+            self.assertEqual(config.getfloat("LOCATION", "MAP_LONG"), -76)
+            self.assertTrue(config.getboolean("FEATURES", "SUNTIME"))
+            self.assertTrue(config.getboolean("FEATURES", "ALT_PREDICTIONS"))
+            self.assertFalse(config.getboolean("FEATURES", "POTOMAC"))
+            self.assertEqual(config.get("GENERAL", "DEPLOYMENT_ID"), "site-1")
+            self.assertEqual(config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S"), 3600)
+            self.assertEqual(config.get("OTHER", "VALUE"), "keep")
+
+    def test_cancelled_setup_does_not_save_location(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = pathlib.Path(directory) / "ws-settings.ini"
+            original = "[LOCATION]\n[FEATURES]\n[GENERAL]\n"
+            settings.write_text(original)
+            with (
+                patch.object(self.location, "interactive_location", return_value=("New", 39, -77)),
+                patch.object(self.location, "dialog", side_effect=self.location.SetupCancelled),
+                self.assertRaises(self.location.SetupCancelled),
+            ):
+                self.location.interactive_setup(str(settings))
+            self.assertEqual(settings.read_text(), original)
+
 
 class ImageSetupTests(unittest.TestCase):
     def test_completed_first_boot_does_not_run_again(self):
@@ -475,9 +528,13 @@ class ImageSetupTests(unittest.TestCase):
             original = "[LOCATION]\nNAME=Station\nLATITUDE=39\nLONGITUDE=-77\n[FEATURES]\nSUNTIME=false\n"
             settings.write_text(original)
             nmcli = home / "nmcli"
-            nano = home / "nano"
-            nano.write_text('#!/bin/sh\nprintf "\\n[EXTRA]\\nVALUE=changed\\n" >> "$1"\n')
-            nano.chmod(0o755)
+            whiptail = home / "whiptail"
+            whiptail.write_text(
+                '#!/bin/sh\ncase "$*" in *--yesno*) exit 1 ;; '
+                '*"Self-update interval"*) echo 3600 >&2 ;; '
+                '*--checklist*) echo SUNTIME >&2 ;; esac\nexit 0\n'
+            )
+            whiptail.chmod(0o755)
             setup = home / "weather-station-setup"
             setup.write_text((root / "image" / "weather-station-setup").read_text().replace(
                 "SHARE=/usr/local/share/weather-station", f'SHARE="{root / "image"}"'
@@ -503,8 +560,10 @@ class ImageSetupTests(unittest.TestCase):
                 ["bash", str(setup)], env=env, input="n\n\n\n", text=True, capture_output=True
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("[EXTRA]\nVALUE=changed", settings.read_text())
-            self.assertIn("Restart the weather station", result.stdout)
+            config = ConfigParser()
+            config.read(settings)
+            self.assertTrue(config.getboolean("FEATURES", "SUNTIME"))
+            self.assertEqual(config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S"), 3600)
 
 
 class CurrentTemperatureTests(unittest.TestCase):

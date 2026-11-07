@@ -35,7 +35,7 @@ The keyboard uses the US English layout and the Wi-Fi country is US.
 On first boot, configure the time zone, Wi-Fi, and station location.
 Look up a US street address online, or enter coordinates manually.
 Press Q to show the desktop. Use Weather Station Setup to run setup again.
-Setup requires an active Wi-Fi connection and opens all settings in nano.
+Setup requires an active Wi-Fi connection and uses keyboard-driven forms.
 Use Ctrl+Alt+E to edit settings, Ctrl+Alt+W for Wi-Fi, or Ctrl+Alt+S to start.
 Use Ctrl+Alt+T to open a terminal or Ctrl+Alt+U to run setup again.
 The settings editor and Wi-Fi tool support keyboard input. The app starts

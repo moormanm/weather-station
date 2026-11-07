@@ -6,35 +6,23 @@ SETTINGS="$HOME/ws-settings.ini"
 
 if ! devices="$(LC_ALL=C nmcli --terse --fields TYPE,STATE device status)"; then
     printf 'Cannot check Wi-Fi. Check that NetworkManager is running.\n' >&2
+    whiptail --title "Weather Station Setup" --msgbox \
+        "Cannot check Wi-Fi. Check that NetworkManager is running." 10 74
     [ ! -t 0 ] || read -r -p "Press Enter to close. "
     exit 1
 fi
 if ! grep -qx 'wifi:connected' <<< "$devices"; then
     printf 'Connect to Wi-Fi before running Weather Station Setup.\n' >&2
+    whiptail --title "Weather Station Setup" --msgbox \
+        "Connect to Wi-Fi before running Weather Station Setup." 10 74
     [ ! -t 0 ] || read -r -p "Press Enter to close. "
     exit 1
 fi
 
-if /usr/bin/python3 "$SHARE/validate-settings.py" "$SETTINGS"; then
-    read -r -p "Change the station location? [y/N]: " choice
-else
-    choice=y
+if ! /usr/bin/python3 "$SHARE/configure-location.py" --setup "$SETTINGS"; then
+    whiptail --title "Weather Station Setup" --msgbox \
+        "Setup did not complete. Run setup again to retry." 10 74
+    exit 1
 fi
-if [ "$choice" = y ] || [ "$choice" = Y ]; then
-    while ! /usr/bin/python3 "$SHARE/configure-location.py" --interactive "$SETTINGS"; do
-        printf 'The location could not be saved. Try again.\n'
-    done
-fi
-
-printf '\nEdit any settings in nano. Press Ctrl+O to save and Ctrl+X to exit.\n'
-read -r -p "Press Enter to open the settings file. "
-while true; do
-    nano "$SETTINGS"
-    if /usr/bin/python3 "$SHARE/validate-settings.py" "$SETTINGS"; then
-        break
-    fi
-    printf 'The settings are invalid. Edit them again.\n'
-    read -r -p "Press Enter to open the settings file. "
-done
-printf 'Settings saved. Restart the weather station to apply them.\n'
-read -r -p "Press Enter to close. "
+whiptail --title "Weather Station Setup" --msgbox \
+    "Settings saved. Restart the weather station to apply them." 10 74

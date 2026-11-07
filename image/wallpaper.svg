@@ -49,4 +49,12 @@
     <circle cx="1191" cy="474" r="4"/>
     <circle cx="747" cy="635" r="2" opacity="0.5"/>
   </g>
+  <g font-family="DejaVu Sans, sans-serif" font-size="21" fill="#d3f5ff">
+    <text x="1445" y="865" font-size="18" font-weight="bold" fill="#7edaff">KEYBOARD SHORTCUTS</text>
+    <text x="1445" y="902">Ctrl+Alt+U — Weather Station Setup</text>
+    <text x="1445" y="934">Ctrl+Alt+W — Wi-Fi Settings</text>
+    <text x="1445" y="966">Ctrl+Alt+E — Edit settings</text>
+    <text x="1445" y="998">Ctrl+Alt+T — Terminal</text>
+    <text x="1445" y="1030">Ctrl+Alt+S — Start Weather Station</text>
+  </g>
 </svg>
