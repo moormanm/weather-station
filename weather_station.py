@@ -999,6 +999,11 @@ class AppState:
                 train_number = str(raw.get("number") or "?")
                 stops = raw.get("stops") or []
                 train = {
+                    "id": str(raw.get("train_id") or (
+                        f"{railroad}:{train_number}:{raw.get('origin_date', '')}:"
+                        f"{raw.get('origin', '')}:{raw.get('destination', '')}"
+                    )),
+                    "raw": raw,
                     "number": train_number,
                     "name": str(raw.get("name") or f"{railroad} {train_number}").strip(),
                     "lat": lat,
@@ -1477,7 +1482,7 @@ def _maybe_self_update_and_restart(repo_dir):
         return False
 
 
-def draw_map(screen, state, fonts, mx, my, mw, mh):
+def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
     """Draw weather radar and live train data over a shared map."""
     if not state.map_tiles:
         return
@@ -1584,6 +1589,12 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
             continue
         color = train["color"]
         radius = 17 if len(train["number"]) >= 3 else 14
+        hitbox = pygame.Rect(
+            mx + tile_ox + train_x - radius, my + tile_oy + train_y - radius,
+            radius * 2 + 1, radius * 2 + 1,
+        ).clip(pygame.Rect(mx + tile_ox, my + tile_oy, MAP_SURFACE_W, MAP_SURFACE_H))
+        train_ui["targets"].append((hitbox, train))
+        hovered = not train_ui["selected"] and hitbox.collidepoint(pygame.mouse.get_pos())
         angle = math.radians(train["bearing"])
         direction_x, direction_y = math.sin(angle), -math.cos(angle)
         perp_x, perp_y = -direction_y, direction_x
@@ -1602,7 +1613,7 @@ def draw_map(screen, state, fonts, mx, my, mw, mh):
         pygame.draw.polygon(tile_surf, (255, 220, 60), head)
         pygame.draw.circle(tile_surf, (12, 16, 22), (train_x, train_y), radius + 2)
         pygame.draw.circle(tile_surf, color, (train_x, train_y), radius)
-        pygame.draw.circle(tile_surf, TEXT_BRIGHT, (train_x, train_y), radius, 2)
+        pygame.draw.circle(tile_surf, GOLD if hovered else TEXT_BRIGHT, (train_x, train_y), radius, 3 if hovered else 2)
         number = fonts["compact_bold"].render(train["number"], True, TEXT_BRIGHT)
         tile_surf.blit(number, number.get_rect(center=(train_x, train_y)))
 
@@ -1711,7 +1722,7 @@ def draw_week_forecast_table(screen, state, fonts, x=60, y=260, w=460):
         )
 
 
-def draw_train_panel(screen, state, fonts, x=1480, y=130, w=380, h=820):
+def draw_train_panel(screen, state, fonts, train_ui, x=1480, y=130, w=380, h=820):
     """Draw nearby live trains in a compact right-side tracking panel."""
     panel = pygame.Rect(x, y, w, h)
     pygame.draw.rect(screen, PANEL, panel, border_radius=12)
@@ -1758,8 +1769,10 @@ def draw_train_panel(screen, state, fonts, x=1480, y=130, w=380, h=820):
     for i, (train, miles) in enumerate(page_trains):
         row_y = y + 88 + i * row_h
         card = pygame.Rect(content_x, row_y, content_w, row_h - 7)
+        train_ui["targets"].append((card, train))
+        hovered = not train_ui["selected"] and card.collidepoint(pygame.mouse.get_pos())
         pygame.draw.rect(screen, (24, 32, 49), card, border_radius=7)
-        pygame.draw.rect(screen, (48, 64, 82), card, 1, border_radius=7)
+        pygame.draw.rect(screen, GOLD if hovered else (48, 64, 82), card, 2 if hovered else 1, border_radius=7)
         pygame.draw.circle(screen, train["color"], (card.left + 15, card.top + 16), 6)
         title = f"#{train['number']}  {train['name']}"
         title = _fit_text(title, fonts["compact_bold"], content_w - 42)
@@ -1780,6 +1793,109 @@ def draw_train_panel(screen, state, fonts, x=1480, y=130, w=380, h=820):
             screen, "Pages change every 10 seconds",
             fonts["compact"], TEXT_DIM, x + 16, y + h - 30,
         )
+
+
+def _train_detail_lines(train, font, max_width):
+    raw = train["raw"]
+    train_type = raw.get("train_type") or "Not provided"
+    heritage = raw.get("heritage")
+    if isinstance(heritage, bool):
+        heritage = "Yes" if heritage else "No"
+    lines = [
+        f"Operator: {raw.get('railroad') or 'Unknown'}",
+        f"Train type: {train_type}",
+        f"Heritage train: {heritage if heritage is not None and heritage != '' else 'Not provided'}",
+        f"Origin: {train['origin']}",
+        f"Destination: {train['destination']}",
+        f"Next stop: {train['next_stop']}",
+        f"Speed: {train['speed']:.0f} mph   Heading: {train['heading']} ({train['bearing']:.0f} degrees)",
+        f"Location: {train['lat']:.5f}, {train['lon']:.5f}",
+        "",
+        "TransitDocs source data (timestamps are Unix seconds):",
+    ]
+    lines.extend(json.dumps(raw, indent=2, ensure_ascii=False).splitlines())
+    wrapped = []
+    for line in lines:
+        while font.size(line)[0] > max_width:
+            low, high = 1, len(line)
+            while low < high:
+                mid = (low + high + 1) // 2
+                if font.size(line[:mid])[0] <= max_width:
+                    low = mid
+                else:
+                    high = mid - 1
+            wrapped.append(line[:low])
+            line = line[low:]
+        wrapped.append(line)
+    return wrapped
+
+
+def _handle_train_event(event, train_ui):
+    if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+        train_ui["selected"] = None
+    elif train_ui["selected"]:
+        if event.type == pygame.MOUSEWHEEL:
+            train_ui["scroll"] -= event.y * 3
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button in (4, 5):
+                train_ui["scroll"] += -3 if event.button == 4 else 3
+            elif event.button == 1 and not train_ui["detail_rect"].collidepoint(event.pos):
+                train_ui["selected"] = None
+            elif event.button == 1 and train_ui["close_rect"].collidepoint(event.pos):
+                train_ui["selected"] = None
+        elif event.type == pygame.KEYDOWN:
+            if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN):
+                train_ui["scroll"] += {
+                    pygame.K_UP: -1, pygame.K_DOWN: 1,
+                    pygame.K_PAGEUP: -20, pygame.K_PAGEDOWN: 20,
+                }[event.key]
+    elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+        for rect, train in reversed(train_ui["targets"]):
+            if rect.collidepoint(event.pos):
+                train_ui["selected"] = train
+                train_ui["scroll"] = 0
+                train_ui["cached_raw"] = None
+                train_ui["detail_rect"] = pygame.Rect((SCREEN_W - 820) // 2, 120, 820, 840)
+                train_ui["close_rect"] = pygame.Rect(train_ui["detail_rect"].right - 48, 130, 36, 36)
+                break
+
+
+def draw_train_details(screen, state, fonts, train_ui):
+    selected = train_ui["selected"]
+    if not selected:
+        return
+    with state.lock:
+        current = next((train for train in state.train_positions if train["id"] == selected["id"]), None)
+    if current:
+        train_ui["selected"] = selected = current
+
+    panel = pygame.Rect((SCREEN_W - 820) // 2, 120, 820, 840)
+    close = pygame.Rect(panel.right - 48, panel.top + 10, 36, 36)
+    train_ui["detail_rect"], train_ui["close_rect"] = panel, close
+    pygame.draw.rect(screen, PANEL, panel, border_radius=12)
+    pygame.draw.rect(screen, ACCENT, panel, 2, border_radius=12)
+    title = _fit_text(f"#{selected['number']}  {selected['name']}", fonts["small"], panel.w - 100)
+    draw_text(screen, title, fonts["small"], TEXT_BRIGHT, panel.x + 20, panel.y + 14)
+    pygame.draw.rect(screen, (48, 64, 82), close, border_radius=5)
+    draw_text(screen, "X", fonts["tiny"], TEXT_BRIGHT, close.centerx, close.centery, anchor="center")
+    status = "Scroll for details  |  Esc to close"
+    if not current:
+        status = "Train no longer in feed; showing last data  |  Esc to close"
+    draw_text(screen, status, fonts["compact"], GOLD, panel.x + 20, panel.y + 53)
+
+    font = fonts["compact"]
+    line_height = font.get_linesize() + 2
+    if train_ui.get("cached_raw") is not selected["raw"]:
+        train_ui["lines"] = _train_detail_lines(selected, font, panel.w - 52)
+        train_ui["cached_raw"] = selected["raw"]
+    lines = train_ui["lines"]
+    visible = (panel.h - 100) // line_height
+    train_ui["scroll"] = max(0, min(train_ui["scroll"], max(0, len(lines) - visible)))
+    for index, line in enumerate(lines[train_ui["scroll"]:train_ui["scroll"] + visible]):
+        draw_text(screen, line, font, TEXT_BRIGHT, panel.x + 20, panel.y + 82 + index * line_height)
+    if len(lines) > visible:
+        draw_text(screen, f"{train_ui['scroll'] + 1}-{min(train_ui['scroll'] + visible, len(lines))} / {len(lines)}",
+                  font, TEXT_DIM, panel.right - 20, panel.bottom - 22, anchor="topright")
 
 
 def draw_wind_widget(screen, state, fonts, cx, cy):
@@ -2495,9 +2611,10 @@ def draw_potomac_widget(screen, state, fonts, x, y, w=440, h=200):
               chart_x + chart_w - 2, chart_y + 2, anchor="topright")
 
 
-def draw_screen(screen, state, fonts, tick):
+def draw_screen(screen, state, fonts, tick, train_ui):
     screen.fill(BG)
     W, H = screen.get_size()
+    train_ui["targets"] = []
 
     with state.lock:
         started_at = state.started_at
@@ -2536,8 +2653,8 @@ def draw_screen(screen, state, fonts, tick):
 
         mx, my = 560, 130
         mw, mh = MAP_SURFACE_W, MAP_SURFACE_H
-        draw_map(screen, state, fonts, mx, my, mw, mh)
-        draw_train_panel(screen, state, fonts)
+        draw_map(screen, state, fonts, mx, my, mw, mh, train_ui)
+        draw_train_panel(screen, state, fonts, train_ui)
 
         wind_center_y = my + mh + 33
         draw_wind_widget(screen, state, fonts, mx + mw // 2, wind_center_y)
@@ -2578,6 +2695,7 @@ def draw_screen(screen, state, fonts, tick):
     wind_bottom = wind_center_y + WIND_WIDGET_RADIUS + 41
     motd_center_y = (wind_bottom + H - 12) // 2
     screen.blit(motd_surf, motd_surf.get_rect(center=(W // 2, motd_center_y)))
+    draw_train_details(screen, state, fonts, train_ui)
 
     # Cycle MOTD every 30 seconds; retry fetch if pool is empty or exhausted
     now = time.time()
@@ -2596,7 +2714,7 @@ def draw_screen(screen, state, fonts, tick):
 def main():
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_W, SCREEN_H), pygame.FULLSCREEN | pygame.DOUBLEBUF | pygame.HWSURFACE)
-    pygame.mouse.set_visible(False)
+    pygame.mouse.set_visible(True)
 
     asset_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
     regular_font_path = os.path.join(asset_dir, "LiberationSans-Regular.ttf")
@@ -2612,6 +2730,7 @@ def main():
     }
 
     state = AppState()
+    train_ui = {"targets": [], "selected": None, "scroll": 0}
     repo_dir = os.path.dirname(os.path.abspath(__file__))
     next_self_update_check = time.time() + SELF_UPDATE_INTERVAL_S
 
@@ -2650,6 +2769,7 @@ def main():
             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_q):
                 pygame.quit()
                 sys.exit()
+            _handle_train_event(e, train_ui)
 
         now = time.time()
         if now >= next_self_update_check:
@@ -2682,7 +2802,7 @@ def main():
             state.last_nfl_upd = now
             _spawn("NFL", state.update_nflstats)
 
-        draw_screen(screen, state, fonts, tick)
+        draw_screen(screen, state, fonts, tick, train_ui)
         pygame.display.flip()
         clock.tick(10)
         tick += 1
