@@ -62,10 +62,13 @@ NFL_API_KEY = config["NFLSTATS"].get("API-KEY", "").strip() if config.has_sectio
 SCREEN_W, SCREEN_H = 1920, 1080
 
 MAP_ZOOM = 9
+MAP_MIN_ZOOM, MAP_MAX_ZOOM = MAP_ZOOM - 1, MAP_ZOOM + 3
 RADAR_ZOOM = 7  # RainViewer tiles are available up to zoom 7
 MAP_SURFACE_W, MAP_SURFACE_H = 900, 780
 WIND_WIDGET_RADIUS = 42
 TRAIN_UPDATE_INTERVAL_S = 30
+MARC_POSITION_URL = "https://mdotmta-gtfs-rt.s3.amazonaws.com/MARC+RT/marc-vp.pb"
+MARC_MAX_AGE_S = 120
 SELF_UPDATE_INTERVAL_S = config.getint("GENERAL", "SELF_UPDATE_INTERVAL_S", fallback=6 * 3600)
 SELF_UPDATE_TIMEOUT_S = 120
 
@@ -117,9 +120,17 @@ def _world_px(lat, lon, zoom):
     )
 
 
-def _map_tile_offsets(zoom):
-    world_x, world_y = _world_px(MAP_LAT, MAP_LONG, zoom)
-    center_x, center_y = _tile_xy(MAP_LAT, MAP_LONG, zoom)
+def _world_center(x, y, zoom):
+    size = 256 * 2 ** zoom
+    x = max(MAP_SURFACE_W / 2, min(size - MAP_SURFACE_W / 2, x))
+    y = max(MAP_SURFACE_H / 2, min(size - MAP_SURFACE_H / 2, y))
+    return (math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / size)))),
+            x / size * 360 - 180)
+
+
+def _map_tile_offsets(zoom, lat=MAP_LAT, lon=MAP_LONG):
+    world_x, world_y = _world_px(lat, lon, zoom)
+    center_x, center_y = _tile_xy(lat, lon, zoom)
     x_min = math.floor((world_x - MAP_SURFACE_W / 2) / 256)
     x_max = math.floor((world_x + MAP_SURFACE_W / 2 - 1) / 256)
     y_min = math.floor((world_y - MAP_SURFACE_H / 2) / 256)
@@ -161,6 +172,52 @@ def _fetch_transitdocs_json(path):
         except ValueError as e:
             last_error = e
     raise RuntimeError(f"TransitDocs {path} unavailable: {last_error}")
+
+
+def _fetch_marc_trains():
+    from google.protobuf.json_format import MessageToDict
+    from google.transit import gtfs_realtime_pb2
+
+    raw = safe_fetch(MARC_POSITION_URL, timeout=20)
+    if not isinstance(raw, bytes):
+        raise RuntimeError("MARC vehicle feed unavailable")
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(raw)
+    now = time.time()
+    if not feed.IsInitialized() or not feed.header.HasField("timestamp") or now - feed.header.timestamp > MARC_MAX_AGE_S:
+        raise ValueError("MARC vehicle feed is invalid or out of date")
+    headings = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+    trains = []
+    for entity in feed.entity:
+        if not entity.HasField("vehicle") or entity.is_deleted:
+            continue
+        vehicle = entity.vehicle
+        if (not vehicle.HasField("position") or not vehicle.HasField("timestamp")
+                or now - vehicle.timestamp > MARC_MAX_AGE_S):
+            continue
+        position = vehicle.position
+        if (not position.HasField("latitude") or not position.HasField("longitude")
+                or not math.isfinite(position.latitude) or not math.isfinite(position.longitude)
+                or not -90 < position.latitude < 90 or not -180 <= position.longitude <= 180):
+            continue
+        trip = vehicle.trip
+        trip_id = trip.trip_id if trip.HasField("trip_id") else entity.id
+        number = re.sub(r"^Train\s*", "", trip_id, flags=re.IGNORECASE) or "?"
+        bearing = position.bearing % 360 if position.HasField("bearing") and math.isfinite(position.bearing) else None
+        speed = position.speed * 2.236936292 if position.HasField("speed") and math.isfinite(position.speed) and position.speed >= 0 else None
+        source = MessageToDict(vehicle, preserving_proto_field_name=True)
+        source["railroad"] = "MARC"
+        trains.append({
+            "id": f"MARC:{trip_id}:{trip.start_date}",
+            "raw": source, "source": "Maryland MTA GTFS Realtime",
+            "number": number, "name": "MARC",
+            "lat": position.latitude, "lon": position.longitude,
+            "speed": speed, "bearing": bearing,
+            "heading": headings[int(bearing / 45 + 0.5) % 8] if bearing is not None else "Unknown",
+            "color": (255, 128, 0), "origin": "Not provided",
+            "destination": "Not provided", "next_stop": "Not provided",
+        })
+    return trains
 
 
 LOC_DOT_OFFSET = (0,0)  # computed dynamically
@@ -698,12 +755,18 @@ class AppState:
         self.map_tiles = {}
         self.map_label_tiles = {}
         self.radar_tiles = {}
+        self.map_zoom = MAP_ZOOM
+        self.map_target_zoom = MAP_ZOOM
+        self.map_center = (MAP_LAT, MAP_LONG)
+        self.map_target_center = self.map_center
         self.train_positions = []
         self.train_stations = []
         self.train_tracks = []
         self.last_train_upd = 0
         self.train_data_loaded = False
         self.train_error = None
+        self.train_stale = False
+        self.transitdocs_loaded = False
         self._map_render_key = None
         self._map_render_surface = None
         self._radar_render_key = None
@@ -790,7 +853,7 @@ class AppState:
         url = (f"https://api.open-meteo.com/v1/forecast?latitude={LATITUDE}&longitude={LONGITUDE}"
                f"&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_sum,sunrise,sunset"
                f"&hourly=temperature_2m,relative_humidity_2m,precipitation_probability"
-               f"&current=temperature_2m,weather_code,wind_speed_10m,wind_direction_10m"
+               f"&current=temperature_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m"
                f"&temperature_unit=fahrenheit&timezone={timezone}&forecast_days=7")
         raw = _cached_fetch(url, _TTL_OPEN_METEO, timeout=20, retries=3, retry_delay=2.0)
         if raw == "RATE_LIMITED":
@@ -853,15 +916,23 @@ class AppState:
             self._map_running = False
 
     def _do_update_map(self):
-        zoom = MAP_ZOOM
-        lat_rad = math.radians(MAP_LAT)
-        n = 2 ** zoom
-        xt = int((MAP_LONG + 180.0) / 360.0 * n)
-        yt = int((1.0 - math.log(math.tan(lat_rad) + 1/math.cos(lat_rad)) / math.pi) / 2.0 * n)
+        with self.lock:
+            zoom = self.map_target_zoom
+            center = self.map_target_center
+            zoom_change = (
+                bool(self.map_tiles)
+                and (zoom != self.map_zoom or center != self.map_center)
+                and _tile_xy(*center, RADAR_ZOOM) == _tile_xy(*self.map_center, RADAR_ZOOM)
+            )
+            radar_tiles = self.radar_tiles
+        xt, yt = _tile_xy(*center, zoom)
 
-        tile_offsets = _map_tile_offsets(zoom)
+        tile_offsets = _map_tile_offsets(zoom, *center)
         new_tiles = {}
         for dx, dy in tile_offsets:
+            with self.lock:
+                if (zoom, center) != (self.map_target_zoom, self.map_target_center):
+                    return
             # ArcGIS World Imagery (Esri), using the standard XYZ tile scheme.
             url = f"https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{zoom}/{yt+dy}/{xt+dx}"
             fname = os.path.join(TILE_CACHE_DIR, hashlib.md5(url.encode()).hexdigest() + ".png")
@@ -881,6 +952,9 @@ class AppState:
         # This supplies city/town names while leaving the aerial imagery visible.
         new_label_tiles = {}
         for dx, dy in tile_offsets:
+            with self.lock:
+                if (zoom, center) != (self.map_target_zoom, self.map_target_center):
+                    return
             label_url = (
                 f"https://server.arcgisonline.com/ArcGIS/rest/services/"
                 f"Reference/World_Boundaries_and_Places/MapServer/tile/"
@@ -907,14 +981,31 @@ class AppState:
             if label_data and label_data != "RATE_LIMITED":
                 new_label_tiles[(dx, dy)] = label_data
 
-        # RainViewer stops at zoom 7, so render those tiles over the closer map.
+        with self.lock:
+            if (zoom, center) != (self.map_target_zoom, self.map_target_center):
+                return
+        new_radar_tiles = radar_tiles if zoom_change else self._fetch_radar_tiles(*center)
+
+        with self.lock:
+            if zoom != self.map_target_zoom or center != self.map_target_center:
+                return
+            self.last_map_upd = time.time()
+            if not new_tiles:
+                return
+            self.map_tiles = new_tiles
+            self.map_label_tiles = new_label_tiles
+            self.radar_tiles = new_radar_tiles
+            self.map_zoom = zoom
+            self.map_center = center
+
+    def _fetch_radar_tiles(self, lat, lon):
         new_radar_tiles = {}
         meta = safe_fetch("https://api.rainviewer.com/public/weather-maps.json")
         if meta and meta != "RATE_LIMITED":
             try:
                 rv = json.loads(meta.decode())
                 path, host = rv["radar"]["past"][-1]["path"], rv["host"]
-                radar_xt, radar_yt = _tile_xy(MAP_LAT, MAP_LONG, RADAR_ZOOM)
+                radar_xt, radar_yt = _tile_xy(lat, lon, RADAR_ZOOM)
                 for dy in range(-1, 2):
                     for dx in range(-1, 2):
                         radar_url = (
@@ -930,18 +1021,45 @@ class AppState:
                             # else: transparent/empty tile, skip silently
             except Exception as e:
                 print(f"Radar fetch error: {e}")
-
-        with self.lock:
-            self.map_tiles = new_tiles
-            self.map_label_tiles = new_label_tiles
-            self.radar_tiles = new_radar_tiles
-            self.last_map_upd = time.time()
+        return new_radar_tiles
 
     # ── Live trains ───────────────────────────────────────────────────────────
     def update_trains(self):
         if self._train_running:
             return
         self._train_running = True
+        try:
+            errors = []
+            transitdocs_ok = False
+            marc_ok = False
+            try:
+                trains, stations, tracks = self._fetch_transitdocs_trains()
+                transitdocs_ok = True
+            except Exception as e:
+                errors.append(f"TransitDocs: {e}")
+                with self.lock:
+                    trains = [train for train in self.train_positions if train.get("source") != "Maryland MTA GTFS Realtime"]
+                    stations, tracks = self.train_stations, self.train_tracks
+            try:
+                trains.extend(_fetch_marc_trains())
+                marc_ok = True
+            except Exception as e:
+                errors.append(f"MARC: {e}")
+            with self.lock:
+                self.transitdocs_loaded = self.transitdocs_loaded or transitdocs_ok
+                self.train_positions = trains
+                self.train_stations = stations
+                self.train_tracks = tracks
+                self.last_train_upd = time.time()
+                self.train_data_loaded = self.transitdocs_loaded or marc_ok
+                self.train_stale = not transitdocs_ok and self.transitdocs_loaded
+                self.train_error = "; ".join(errors) or None
+            if errors:
+                print(f"Train data update error: {'; '.join(errors)}")
+        finally:
+            self._train_running = False
+
+    def _fetch_transitdocs_trains(self):
         try:
             map_data = _fetch_transitdocs_json("map")
             station_data = _fetch_transitdocs_json("stationInfo")
@@ -976,15 +1094,6 @@ class AppState:
             tracks = []
             seen_segments = set()
             headings = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
-            map_center_x, map_center_y = _world_px(MAP_LAT, MAP_LONG, MAP_ZOOM)
-
-            def in_map(lat, lon):
-                point_x, point_y = _world_px(lat, lon, MAP_ZOOM)
-                return (
-                    abs(point_x - map_center_x) <= MAP_SURFACE_W / 2 + 256
-                    and abs(point_y - map_center_y) <= MAP_SURFACE_H / 2 + 256
-                )
-
             for raw in map_data:
                 location = raw.get("location") or {}
                 try:
@@ -1048,8 +1157,6 @@ class AppState:
                 for first, second in zip(route, route[1:]):
                     if _distance_miles(first, second) > 450:
                         continue
-                    if not (in_map(*first) or in_map(*second)):
-                        continue
                     key = tuple(sorted((
                         (round(first[0], 4), round(first[1], 4)),
                         (round(second[0], 4), round(second[1], 4)),
@@ -1058,20 +1165,9 @@ class AppState:
                         seen_segments.add(key)
                         tracks.append((first, second))
 
-            stations = [station for station in stations if in_map(station["lat"], station["lon"])]
-            with self.lock:
-                self.train_positions = trains
-                self.train_stations = stations
-                self.train_tracks = tracks
-                self.last_train_upd = time.time()
-                self.train_data_loaded = True
-                self.train_error = None
+            return trains, stations, tracks
         except Exception as e:
-            print(f"Train data update error: {e}")
-            with self.lock:
-                self.train_error = str(e)
-        finally:
-            self._train_running = False
+            raise RuntimeError(f"TransitDocs update failed: {e}") from e
 
     # ── RAM Price ─────────────────────────────────────────────────────────────
     def update_ram(self):
@@ -1484,15 +1580,18 @@ def _maybe_self_update_and_restart(repo_dir):
 
 def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
     """Draw weather radar and live train data over a shared map."""
+    tile_ox = (mw - MAP_SURFACE_W) // 2
+    tile_oy = (mh - MAP_SURFACE_H) // 2
+    train_ui["map_rect"] = pygame.Rect(mx + tile_ox, my + tile_oy, MAP_SURFACE_W, MAP_SURFACE_H)
     if not state.map_tiles:
         return
 
     TILE = 256.0
-    zoom = MAP_ZOOM
+    zoom = state.map_zoom
 
-    map_world_x, map_world_y = _world_px(MAP_LAT, MAP_LONG, zoom)
+    map_world_x, map_world_y = _world_px(*state.map_center, zoom)
 
-    center_xt, center_yt = _tile_xy(MAP_LAT, MAP_LONG, zoom)
+    center_xt, center_yt = _tile_xy(*state.map_center, zoom)
 
     map_cx, map_cy = MAP_SURFACE_W / 2, MAP_SURFACE_H / 2
 
@@ -1504,7 +1603,8 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
 
     if (state._map_render_key is None
             or state._map_render_key[0] is not state.map_tiles
-            or state._map_render_key[1] is not state.map_label_tiles):
+            or state._map_render_key[1] is not state.map_label_tiles
+            or state._map_render_key[2:] != (zoom, state.map_center)):
         base = pygame.Surface((MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA)
         base.fill(BG)
         for (dx, dy), blob in state.map_tiles.items():
@@ -1520,20 +1620,19 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
             except Exception as e:
                 print(f"Map label draw error: {e}")
         state._map_render_surface = base
-        state._map_render_key = (state.map_tiles, state.map_label_tiles)
+        state._map_render_key = (state.map_tiles, state.map_label_tiles, zoom, state.map_center)
 
     tile_surf = state._map_render_surface.copy()
-    tile_ox = (mw - MAP_SURFACE_W) // 2
-    tile_oy = (mh - MAP_SURFACE_H) // 2
 
-    # RainViewer zoom-7 tiles cover four zoom-9 tiles in each direction.
     radar_zoom_scale = 2 ** (zoom - RADAR_ZOOM)
     radar_tile_px = int(TILE * radar_zoom_scale)
-    if state._radar_render_key is not state.radar_tiles:
+    if (state._radar_render_key is None
+            or state._radar_render_key[0] is not state.radar_tiles
+            or state._radar_render_key[1:] != (zoom, state.map_center)):
         radar_surface = pygame.Surface(
             (MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA
         )
-        radar_xt, radar_yt = _tile_xy(MAP_LAT, MAP_LONG, RADAR_ZOOM)
+        radar_xt, radar_yt = _tile_xy(*state.map_center, RADAR_ZOOM)
         for (dx, dy), blob in state.radar_tiles.items():
             try:
                 radar_x = int(round(
@@ -1546,15 +1645,20 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
                         and radar_x + radar_tile_px > 0
                         and radar_y + radar_tile_px > 0):
                     image = pygame.image.load(io.BytesIO(blob)).convert_alpha()
-                    image.set_alpha(180)
+                    left = max(0, -radar_x // radar_zoom_scale)
+                    top = max(0, -radar_y // radar_zoom_scale)
+                    right = min(256, math.ceil((MAP_SURFACE_W - radar_x) / radar_zoom_scale))
+                    bottom = min(256, math.ceil((MAP_SURFACE_H - radar_y) / radar_zoom_scale))
+                    image = image.subsurface((left, top, right - left, bottom - top))
                     image = pygame.transform.smoothscale(
-                        image, (radar_tile_px, radar_tile_px)
+                        image, (image.get_width() * radar_zoom_scale, image.get_height() * radar_zoom_scale)
                     )
-                    radar_surface.blit(image, (radar_x, radar_y))
+                    image.set_alpha(180)
+                    radar_surface.blit(image, (radar_x + left * radar_zoom_scale, radar_y + top * radar_zoom_scale))
             except Exception as e:
                 print(f"Radar draw error: {e}")
         state._radar_render_surface = radar_surface
-        state._radar_render_key = state.radar_tiles
+        state._radar_render_key = (state.radar_tiles, zoom, state.map_center)
     tile_surf.blit(state._radar_render_surface, (0, 0))
 
     # Draw the rail network below station and train markers.
@@ -1565,6 +1669,9 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
               int(round(map_cy + y1w - map_world_y)))
         p2 = (int(round(map_cx + x2w - map_world_x)),
               int(round(map_cy + y2w - map_world_y)))
+        if (max(p1[0], p2[0]) < 0 or min(p1[0], p2[0]) >= MAP_SURFACE_W
+                or max(p1[1], p2[1]) < 0 or min(p1[1], p2[1]) >= MAP_SURFACE_H):
+            continue
         pygame.draw.line(tile_surf, (12, 20, 24), p1, p2, 5)
         pygame.draw.line(tile_surf, (100, 200, 100), p1, p2, 2)
 
@@ -1595,38 +1702,31 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
         ).clip(pygame.Rect(mx + tile_ox, my + tile_oy, MAP_SURFACE_W, MAP_SURFACE_H))
         train_ui["targets"].append((hitbox, train))
         hovered = not train_ui["selected"] and hitbox.collidepoint(pygame.mouse.get_pos())
-        angle = math.radians(train["bearing"])
-        direction_x, direction_y = math.sin(angle), -math.cos(angle)
-        perp_x, perp_y = -direction_y, direction_x
-        tip_len, head_len, head_half = radius + 18, 18, 7
-        tip = (train_x + direction_x * tip_len, train_y + direction_y * tip_len)
-        base = (tip[0] - direction_x * head_len, tip[1] - direction_y * head_len)
-        head = [
-            tip,
-            (base[0] + perp_x * head_half, base[1] + perp_y * head_half),
-            (base[0] - perp_x * head_half, base[1] - perp_y * head_half),
-        ]
-        pygame.draw.line(tile_surf, (12, 16, 22), (train_x, train_y), base, 7)
-        pygame.draw.polygon(tile_surf, (12, 16, 22), head)
-        pygame.draw.polygon(tile_surf, (12, 16, 22), head, 4)
-        pygame.draw.line(tile_surf, (255, 220, 60), (train_x, train_y), base, 3)
-        pygame.draw.polygon(tile_surf, (255, 220, 60), head)
+        if train["bearing"] is not None:
+            angle = math.radians(train["bearing"])
+            direction_x, direction_y = math.sin(angle), -math.cos(angle)
+            perp_x, perp_y = -direction_y, direction_x
+            tip_len, head_len, head_half = radius + 18, 18, 7
+            tip = (train_x + direction_x * tip_len, train_y + direction_y * tip_len)
+            base = (tip[0] - direction_x * head_len, tip[1] - direction_y * head_len)
+            head = [
+                tip,
+                (base[0] + perp_x * head_half, base[1] + perp_y * head_half),
+                (base[0] - perp_x * head_half, base[1] - perp_y * head_half),
+            ]
+            pygame.draw.line(tile_surf, (12, 16, 22), (train_x, train_y), base, 7)
+            pygame.draw.polygon(tile_surf, (12, 16, 22), head)
+            pygame.draw.polygon(tile_surf, (12, 16, 22), head, 4)
+            pygame.draw.line(tile_surf, (255, 220, 60), (train_x, train_y), base, 3)
+            pygame.draw.polygon(tile_surf, (255, 220, 60), head)
         pygame.draw.circle(tile_surf, (12, 16, 22), (train_x, train_y), radius + 2)
         pygame.draw.circle(tile_surf, color, (train_x, train_y), radius)
         pygame.draw.circle(tile_surf, GOLD if hovered else TEXT_BRIGHT, (train_x, train_y), radius, 3 if hovered else 2)
         number = fonts["compact_bold"].render(train["number"], True, TEXT_BRIGHT)
         tile_surf.blit(number, number.get_rect(center=(train_x, train_y)))
 
-    # ------------------------------------------------------------------
-    # WEATHER LOCATION -- LATITUDE/LONGITUDE ONLY
-    # ------------------------------------------------------------------
-    # Project the actual weather coordinates into the same world-pixel
-    # coordinate system.  This does not use MAP_LAT or MAP_LONG.
     weather_world_x, weather_world_y = _world_px(LATITUDE, LONGITUDE, zoom)
 
-    # Because MAP_LAT/MAP_LONG is the exact center of the map, the exact
-    # weather coordinate is simply its world-pixel displacement from that
-    # independent map center.
     dot_x = int(round(map_cx + weather_world_x - map_world_x))
     dot_y = int(round(map_cy + weather_world_y - map_world_y))
 
@@ -1634,22 +1734,20 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
     pygame.draw.circle(tile_surf, ACCENT, (dot_x, dot_y), 6)
     pygame.draw.circle(tile_surf, (255, 255, 255), (dot_x, dot_y), 2)
 
-    # LOCATION_NAME is anchored to the exact LATITUDE/LONGITUDE marker.
-    label_font = fonts["tiny"]
-    label_img = label_font.render(LOCATION_NAME, True, TEXT_BRIGHT)
-    label_pad_x, label_pad_y = 8, 4
-    label_w, label_h = label_img.get_size()
-    label_box_w = label_w + label_pad_x * 2
-    label_box_h = label_h + label_pad_y * 2
+    if 0 <= dot_x < MAP_SURFACE_W and 0 <= dot_y < MAP_SURFACE_H:
+        label_font = fonts["tiny"]
+        label_img = label_font.render(LOCATION_NAME, True, TEXT_BRIGHT)
+        label_pad_x, label_pad_y = 8, 4
+        label_w, label_h = label_img.get_size()
+        label_box_w = label_w + label_pad_x * 2
+        label_box_h = label_h + label_pad_y * 2
 
-    label_x = dot_x - label_box_w // 2
-    label_y = dot_y - label_box_h - 12
-    label_x = max(6, min(label_x, MAP_SURFACE_W - label_box_w - 6))
-    label_y = max(6, min(label_y, MAP_SURFACE_H - label_box_h - 6))
-    label_box = pygame.Rect(label_x, label_y, label_box_w, label_box_h)
-    pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
-    pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
-    tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
+        label_x = max(6, min(dot_x - label_box_w // 2, MAP_SURFACE_W - label_box_w - 6))
+        label_y = max(6, min(dot_y - label_box_h - 12, MAP_SURFACE_H - label_box_h - 6))
+        label_box = pygame.Rect(label_x, label_y, label_box_w, label_box_h)
+        pygame.draw.rect(tile_surf, (12, 16, 28, 230), label_box, border_radius=6)
+        pygame.draw.rect(tile_surf, ACCENT, label_box, 1, border_radius=6)
+        tile_surf.blit(label_img, (label_box.x + label_pad_x, label_box.y + label_pad_y))
 
     # Rounded clipping mask.
     mask_surf = pygame.Surface((MAP_SURFACE_W, MAP_SURFACE_H), pygame.SRCALPHA)
@@ -1661,6 +1759,72 @@ def draw_map(screen, state, fonts, mx, my, mw, mh, train_ui):
     tile_surf.blit(mask_surf, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
 
     screen.blit(tile_surf, (mx + tile_ox, my + tile_oy))
+
+
+def _draw_map_zoom_controls(screen, state, fonts, train_ui, mx, my, mw):
+    minus = pygame.Rect(mx + mw - 152, my + 12, 38, 38)
+    plus = pygame.Rect(mx + mw - 50, my + 12, 38, 38)
+    train_ui["zoom_controls"] = (minus, plus)
+    background = pygame.Rect(minus.left, minus.top, plus.right - minus.left, minus.height)
+    pygame.draw.rect(screen, PANEL, background, border_radius=6)
+    for rect, label, enabled in (
+        (minus, "-", state.map_target_zoom > MAP_MIN_ZOOM),
+        (plus, "+", state.map_target_zoom < MAP_MAX_ZOOM),
+    ):
+        pygame.draw.rect(screen, (48, 64, 82), rect, 1, border_radius=6)
+        draw_text(screen, label, fonts["small"], TEXT_BRIGHT if enabled else TEXT_DIM,
+                  rect.centerx, rect.centery, anchor="center")
+    draw_text(screen, f"{state.map_zoom - MAP_MIN_ZOOM + 1}/5", fonts["tiny"], TEXT_BRIGHT,
+              (minus.right + plus.left) // 2, minus.centery, anchor="center")
+    if state.map_target_zoom != state.map_zoom:
+        draw_text(screen, f"Loading {state.map_target_zoom - MAP_MIN_ZOOM + 1}/5",
+                  fonts["compact"], TEXT_BRIGHT, background.centerx, background.bottom + 5, anchor="midtop")
+
+
+def _handle_map_zoom_event(event, state, train_ui):
+    if train_ui["selected"]:
+        return False
+    change = 0
+    anchor = None
+    if event.type == pygame.KEYDOWN:
+        if event.key in (pygame.K_PLUS, pygame.K_EQUALS, pygame.K_KP_PLUS):
+            change = 1
+        elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            change = -1
+    elif event.type == pygame.MOUSEWHEEL:
+        pos = pygame.mouse.get_pos()
+        if train_ui.get("map_rect") and train_ui["map_rect"].collidepoint(pos):
+            change = event.y
+            anchor = pos
+    elif event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+        controls = train_ui.get("zoom_controls")
+        if controls and controls[0].union(controls[1]).collidepoint(event.pos):
+            if event.button == 1:
+                if controls[0].collidepoint(event.pos):
+                    change = -1
+                elif controls[1].collidepoint(event.pos):
+                    change = 1
+            if not change:
+                return True
+        elif train_ui.get("map_rect") and train_ui["map_rect"].collidepoint(event.pos):
+            if event.button == 1 and any(rect.collidepoint(event.pos) for rect, _ in train_ui["targets"]):
+                return False
+            change = 1 if event.button == 1 else -1
+            anchor = event.pos
+    if not change:
+        return False
+    with state.lock:
+        zoom = max(MAP_MIN_ZOOM, min(MAP_MAX_ZOOM, state.map_target_zoom + change))
+        if zoom != state.map_target_zoom:
+            if anchor is not None:
+                rect = train_ui["map_rect"]
+                dx, dy = anchor[0] - rect.centerx, anchor[1] - rect.centery
+                x, y = _world_px(*state.map_center, state.map_zoom)
+                scale = 2 ** (zoom - state.map_zoom)
+                state.map_target_center = _world_center((x + dx) * scale - dx, (y + dy) * scale - dy, zoom)
+            state.map_target_zoom = zoom
+            state.last_map_upd = 0
+    return True
 
 
 def _fit_text(text, font, max_width):
@@ -1744,17 +1908,18 @@ def draw_train_panel(screen, state, fonts, train_ui, x=1480, y=130, w=380, h=820
         message = "Train data unavailable" if state.train_error else "Loading train data..."
         draw_text(screen, message, fonts["compact"], GOLD, x + 16, y + 96)
         return
-    if not nearby:
-        draw_text(screen, "No trains within 200 mi", fonts["compact"], TEXT_DIM, x + 16, y + 96)
-        return
-
     now = time.time()
     age = now - state.last_train_upd if state.last_train_upd else None
-    if state.train_error or (age is not None and age > TRAIN_UPDATE_INTERVAL_S * 4):
+    if state.train_stale or (age is not None and age > TRAIN_UPDATE_INTERVAL_S * 4):
         status, color = "STALE", GOLD
+    elif state.train_error:
+        status, color = "PARTIAL", GOLD
     else:
         status, color = "LIVE", GREEN
     draw_text(screen, status, fonts["compact"], color, x + w - 16, y + 48, anchor="topright")
+    if not nearby:
+        draw_text(screen, "No trains within 200 mi", fonts["compact"], TEXT_DIM, x + 16, y + 96)
+        return
     pygame.draw.line(screen, (48, 64, 82), (x + 12, y + 78), (x + w - 12, y + 78), 1)
 
     content_x = x + 12
@@ -1779,7 +1944,8 @@ def draw_train_panel(screen, state, fonts, train_ui, x=1480, y=130, w=380, h=820
         draw_text(screen, title, fonts["compact_bold"], TEXT_BRIGHT, card.left + 28, card.top + 6)
         next_stop = _fit_text(f"Next: {train['next_stop']}", fonts["compact"], content_w - 18)
         draw_text(screen, next_stop, fonts["compact"], ACCENT, card.left + 10, card.top + 29)
-        details = f"{train['speed']:.0f} mph  {train['heading']}  ·  {miles:.0f} mi away"
+        speed = f"{train['speed']:.0f} mph" if train["speed"] is not None else "Speed unavailable"
+        details = f"{speed}  {train['heading']}  ·  {miles:.0f} mi away"
         details = _fit_text(details, fonts["compact"], content_w - 18)
         draw_text(screen, details, fonts["compact"], TEXT_DIM, card.left + 10, card.top + 52)
 
@@ -1801,6 +1967,8 @@ def _train_detail_lines(train, font, max_width):
     heritage = raw.get("heritage")
     if isinstance(heritage, bool):
         heritage = "Yes" if heritage else "No"
+    speed = f"{train['speed']:.0f} mph" if train["speed"] is not None else "Not provided"
+    heading = f"{train['heading']} ({train['bearing']:.0f} degrees)" if train["bearing"] is not None else "Not provided"
     lines = [
         f"Operator: {raw.get('railroad') or 'Unknown'}",
         f"Train type: {train_type}",
@@ -1808,10 +1976,10 @@ def _train_detail_lines(train, font, max_width):
         f"Origin: {train['origin']}",
         f"Destination: {train['destination']}",
         f"Next stop: {train['next_stop']}",
-        f"Speed: {train['speed']:.0f} mph   Heading: {train['heading']} ({train['bearing']:.0f} degrees)",
+        f"Speed: {speed}   Heading: {heading}",
         f"Location: {train['lat']:.5f}, {train['lon']:.5f}",
         "",
-        "TransitDocs source data (timestamps are Unix seconds):",
+        f"{train.get('source', 'TransitDocs')} source data (timestamps are Unix seconds):",
     ]
     lines.extend(json.dumps(raw, indent=2, ensure_ascii=False).splitlines())
     wrapped = []
@@ -2641,6 +2809,9 @@ def draw_screen(screen, state, fonts, tick, train_ui):
             screen.blit(temp_surf, (60, 80))
             icon_x = 60 + temp_surf.get_width() + 18 + 55
             draw_weather_icon(screen, cur["weather_code"], icon_x, 175, 60, GOLD)
+            feels_like = cur.get("apparent_temperature")
+            feels_text = f"{round(feels_like)}°" if isinstance(feels_like, (int, float)) and math.isfinite(feels_like) else "--"
+            draw_text(screen, f"Feels like {feels_text}", fonts["tiny"], TEXT_DIM, 60, 235)
         else:
             bootstrap_loading = (not weather_loaded_once) and (time.time() - started_at < 90)
             if bootstrap_loading:
@@ -2654,6 +2825,7 @@ def draw_screen(screen, state, fonts, tick, train_ui):
         mx, my = 560, 130
         mw, mh = MAP_SURFACE_W, MAP_SURFACE_H
         draw_map(screen, state, fonts, mx, my, mw, mh, train_ui)
+        _draw_map_zoom_controls(screen, state, fonts, train_ui, mx, my, mw)
         draw_train_panel(screen, state, fonts, train_ui)
 
         wind_center_y = my + mh + 33
@@ -2769,7 +2941,8 @@ def main():
             if e.type == pygame.QUIT or (e.type == pygame.KEYDOWN and e.key == pygame.K_q):
                 pygame.quit()
                 sys.exit()
-            _handle_train_event(e, train_ui)
+            if not _handle_map_zoom_event(e, state, train_ui):
+                _handle_train_event(e, train_ui)
 
         now = time.time()
         if now >= next_self_update_check:
@@ -2780,7 +2953,9 @@ def main():
         if now - state.last_weather_upd > 60 and not state._weather_running:
             state.last_weather_upd = now
             _spawn("WEATHER", state.update_weather, clear_on_success=False)
-        if now - state.last_map_upd > 60 and not state._map_running:
+        map_interval = 5 if (state.map_target_zoom != state.map_zoom
+                             or state.map_target_center != state.map_center) else 60
+        if now - state.last_map_upd > map_interval and not state._map_running:
             state.last_map_upd = now
             _spawn("MAP", state.update_map)
         if now - state.last_train_upd > TRAIN_UPDATE_INTERVAL_S and not state._train_running:

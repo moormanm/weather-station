@@ -1,4 +1,7 @@
-
+# For MARC train positions, install the feed dependency for the Python used by
+# the app: python3 -m pip install -r requirements-marc.txt
+# On Raspberry Pi OS Bookworm, use:
+# /usr/bin/python3 -m pip install --user --break-system-packages -r requirements-marc.txt
 [LOCATION]
 
 #LATITUDE=38.3663
